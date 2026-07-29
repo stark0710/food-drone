@@ -354,6 +354,44 @@ def get_drone_assignment(drone_id: str, db: Session = Depends(get_db)):
     }
 
 
+@app.post("/drones/{drone_id}/report-in-flight")
+def report_in_flight(drone_id: str, db: Session = Depends(get_db)):
+    """
+    Called by the Pi (not the supplier app) right after it detects the
+    vehicle has actually armed and taken off. No supplier bearer token is
+    involved here — the drone authenticates itself only by drone_id, which
+    is fine for a prototype but is NOT something to expose on the open
+    internet as-is before adding a per-drone shared secret/device token.
+    """
+    order = (
+        db.query(Order)
+        .filter(Order.drone_id == drone_id, Order.status == OrderStatus.dispatched)
+        .order_by(Order.dispatched_at.desc())
+        .first()
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="No dispatched order for this drone")
+    return order_to_out(transition(order, OrderStatus.in_flight, db), db)
+
+
+@app.post("/drones/{drone_id}/report-delivered")
+def report_delivered(drone_id: str, db: Session = Depends(get_db)):
+    """
+    Called by the Pi once it sees the vehicle disarm after completing the
+    outbound (delivery) leg of the mission — i.e. it landed at the
+    destination. Same device-trust caveat as report-in-flight above.
+    """
+    order = (
+        db.query(Order)
+        .filter(Order.drone_id == drone_id, Order.status == OrderStatus.in_flight)
+        .order_by(Order.dispatched_at.desc())
+        .first()
+    )
+    if not order:
+        raise HTTPException(status_code=404, detail="No in-flight order for this drone")
+    return order_to_out(transition(order, OrderStatus.delivered, db), db)
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
