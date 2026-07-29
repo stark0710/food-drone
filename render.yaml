@@ -1,0 +1,51 @@
+# Render Blueprint — deploys the FastAPI backend + a free Postgres instance
+# together. Push this repo to GitHub, then in the Render dashboard:
+# New -> Blueprint -> pick this repo -> Render reads this file automatically.
+#
+# NOTE: Render's free Postgres expires after 30 days (fine for a prototype,
+# just re-provision if the demo runs long). Free web services spin down after
+# 15 min idle; first request after that takes 30-60s to wake up.
+
+databases:
+  - name: hubdrone-db
+    plan: free
+    region: oregon
+    postgresMajorVersion: 16
+
+services:
+  - type: web
+    name: hubdrone-supplier-web
+    runtime: static
+    rootDir: supplier_web
+    buildCommand: "echo 'no build step — static HTML/CSS/JS'"
+    staticPublishPath: .
+    # SPA-style catch-all isn't needed (single index.html, no client router),
+    # but harmless to keep requests for unknown paths falling back to it.
+    routes:
+      - type: rewrite
+        source: /*
+        destination: /index.html
+
+  - type: web
+    name: hubdrone-backend
+    runtime: python
+    plan: free
+    region: oregon
+    rootDir: backend
+    buildCommand: "pip install -r requirements.txt"
+    startCommand: "python seed.py && uvicorn main:app --host 0.0.0.0 --port $PORT"
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.9
+      - key: DATABASE_URL
+        fromDatabase:
+          name: hubdrone-db
+          property: connectionString
+      - key: TEST_CUSTOMER_ID
+        value: cust_test_1
+      - key: TEST_CUSTOMER_TOKEN
+        value: customer-dev-token
+      - key: TEST_SUPPLIER_ID
+        value: sup_test_1
+      - key: TEST_SUPPLIER_TOKEN
+        value: supplier-dev-token

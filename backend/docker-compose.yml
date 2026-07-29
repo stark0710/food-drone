@@ -1,0 +1,16 @@
+version: "3.8"
+services:
+  db:
+    image: postgres:16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: drone
+      POSTGRES_PASSWORD: drone
+      POSTGRES_DB: food_drone
+    ports:
+      - "5432:5432"
+    volumes:
+      - drone_pg_data:/var/lib/postgresql/data
+
+volumes:
+  drone_pg_data:

@@ -1,0 +1,48 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>HubDrone Supplier</title>
+<link rel="stylesheet" href="style.css" />
+<script src="https://unpkg.com/html5-qrcode@2.3.8/html5-qrcode.min.js"></script>
+</head>
+<body>
+  <header>
+    <h1>Hub A Kitchen — Incoming Orders</h1>
+    <span id="conn-status" class="pill">connecting…</span>
+  </header>
+
+  <main id="orders-list">
+    <p class="empty-state">Loading orders…</p>
+  </main>
+
+  <!-- Drone QR scan modal, shown when supplier clicks "Dispatch" -->
+  <div id="scan-modal" class="modal hidden">
+    <div class="modal-card">
+      <h2>Scan drone QR to dispatch</h2>
+      <p class="muted">Point the camera at the QR code printed on the drone.</p>
+      <div id="qr-reader"></div>
+      <div class="manual-entry">
+        <p class="muted">Or enter manually:</p>
+        <input id="manual-drone-input" placeholder="e.g. DRONE:drone_042" />
+        <button id="manual-drone-submit">Confirm</button>
+      </div>
+      <!-- Shown once the drone QR is scanned/entered, replacing the reader
+           while bind-drone-and-dispatch is in flight. -->
+      <div id="route-confirm" class="route-confirm hidden">
+        <div class="route-confirm-label">Dispatching to</div>
+        <div class="route-confirm-path">
+          <span id="route-confirm-from">—</span>
+          <span class="route-arrow">→</span>
+          <span id="route-confirm-to">—</span>
+        </div>
+        <div id="route-confirm-status" class="route-confirm-status">Confirming with drone…</div>
+      </div>
+      <button id="scan-cancel" class="secondary">Cancel</button>
+    </div>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>

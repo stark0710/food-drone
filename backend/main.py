@@ -1,0 +1,333 @@
+import os
+import uuid
+from datetime import datetime, timezone
+from typing import List
+
+from fastapi import FastAPI, Depends, HTTPException, Header
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.orm import Session
+from dotenv import load_dotenv
+
+from database import Base, engine, get_db
+import models
+from models import Order, Hub, Supplier, MenuItem, OrderStatus, ALLOWED_TRANSITIONS
+import schemas
+
+load_dotenv()
+
+app = FastAPI(title="Hub-to-Hub Drone Delivery API")
+
+# Wide open for prototype — lock down before anything but local/dev use.
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# Creates tables if they don't exist yet (fine for a 2-week prototype;
+# swap for Alembic migrations if this grows past the prototype stage).
+Base.metadata.create_all(bind=engine)
+
+TEST_CUSTOMER_ID = os.getenv("TEST_CUSTOMER_ID", "cust_test_1")
+TEST_CUSTOMER_TOKEN = os.getenv("TEST_CUSTOMER_TOKEN", "customer-dev-token")
+TEST_SUPPLIER_ID = os.getenv("TEST_SUPPLIER_ID", "sup_test_1")
+TEST_SUPPLIER_TOKEN = os.getenv("TEST_SUPPLIER_TOKEN", "supplier-dev-token")
+
+
+# ---------------------------------------------------------------------------
+# Mocked auth — single hardcoded customer + supplier identity via bearer token.
+# Swap these dependency functions for real auth later without touching routes.
+# ---------------------------------------------------------------------------
+
+def require_customer(authorization: str = Header(default="")) -> str:
+    token = authorization.replace("Bearer ", "").strip()
+    if token != TEST_CUSTOMER_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid customer token")
+    return TEST_CUSTOMER_ID
+
+
+def require_supplier(authorization: str = Header(default="")) -> str:
+    token = authorization.replace("Bearer ", "").strip()
+    if token != TEST_SUPPLIER_TOKEN:
+        raise HTTPException(status_code=401, detail="Invalid supplier token")
+    return TEST_SUPPLIER_ID
+
+
+def now():
+    return datetime.now(timezone.utc)
+
+
+def order_to_out(o: Order, db: Session) -> schemas.OrderOut:
+    # Prototype has origin_hub_id == destination_hub_id, but look each up
+    # independently so this is already correct once multi-hub routing lands.
+    origin_hub = db.query(Hub).filter(Hub.hub_id == o.origin_hub_id).first()
+    destination_hub = (
+        origin_hub
+        if o.destination_hub_id == o.origin_hub_id
+        else db.query(Hub).filter(Hub.hub_id == o.destination_hub_id).first()
+    )
+    return schemas.OrderOut(
+        order_id=o.order_id,
+        origin_hub_id=o.origin_hub_id,
+        origin_hub_name=origin_hub.name if origin_hub else None,
+        origin_hub_lat=origin_hub.gps_lat if origin_hub else None,
+        origin_hub_lng=origin_hub.gps_lng if origin_hub else None,
+        destination_hub_id=o.destination_hub_id,
+        destination_hub_name=destination_hub.name if destination_hub else None,
+        destination_hub_lat=destination_hub.gps_lat if destination_hub else None,
+        destination_hub_lng=destination_hub.gps_lng if destination_hub else None,
+        supplier_id=o.supplier_id,
+        customer_id=o.customer_id,
+        items=[schemas.OrderItemOut(**i) for i in o.items],
+        total_cents=o.total_cents,
+        status=o.status,
+        drone_id=o.drone_id,
+        placed_at=o.placed_at,
+        accepted_at=o.accepted_at,
+        preparing_at=o.preparing_at,
+        dispatched_at=o.dispatched_at,
+        in_flight_at=o.in_flight_at,
+        delivered_at=o.delivered_at,
+        cancelled_at=o.cancelled_at,
+    )
+
+
+def transition(o: Order, new_status: OrderStatus, db: Session):
+    allowed = ALLOWED_TRANSITIONS[o.status]
+    if new_status not in allowed:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot move order from '{o.status.value}' to '{new_status.value}'",
+        )
+    o.status = new_status
+    ts_field = {
+        OrderStatus.accepted: "accepted_at",
+        OrderStatus.preparing: "preparing_at",
+        OrderStatus.dispatched: "dispatched_at",
+        OrderStatus.in_flight: "in_flight_at",
+        OrderStatus.delivered: "delivered_at",
+        OrderStatus.cancelled: "cancelled_at",
+    }.get(new_status)
+    if ts_field:
+        setattr(o, ts_field, now())
+    db.commit()
+    db.refresh(o)
+    return o
+
+
+# ===========================================================================
+# CUSTOMER-FACING ENDPOINTS
+# ===========================================================================
+
+@app.get("/hubs/{marker_id}/scan", response_model=schemas.ScanHubResponse)
+def scan_hub(marker_id: str, db: Session = Depends(get_db)):
+    """
+    Resolve a scanned physical QR marker_id -> hub_id -> available suppliers + menus.
+    This is the ONLY thing encoded in the hub QR code (marker_id); everything else
+    is looked up server-side so menus can change without reprinting QR codes.
+    """
+    hub = db.query(Hub).filter(Hub.marker_id == marker_id).first()
+    if not hub:
+        raise HTTPException(status_code=404, detail="Unknown hub QR code")
+
+    suppliers = (
+        db.query(Supplier)
+        .filter(Supplier.hub_id == hub.hub_id, Supplier.active.is_(True))
+        .all()
+    )
+
+    suppliers_out = []
+    for s in suppliers:
+        items = (
+            db.query(MenuItem)
+            .filter(MenuItem.supplier_id == s.supplier_id, MenuItem.available.is_(True))
+            .all()
+        )
+        suppliers_out.append(
+            schemas.SupplierWithMenuOut(
+                supplier_id=s.supplier_id,
+                name=s.name,
+                menu_items=[schemas.MenuItemOut.model_validate(i) for i in items],
+            )
+        )
+
+    return schemas.ScanHubResponse(
+        hub_id=hub.hub_id, hub_name=hub.name, suppliers=suppliers_out
+    )
+
+
+@app.post("/orders", response_model=schemas.OrderOut)
+def place_order(
+    req: schemas.PlaceOrderRequest,
+    db: Session = Depends(get_db),
+    customer_id: str = Depends(require_customer),
+):
+    hub = db.query(Hub).filter(Hub.hub_id == req.hub_id).first()
+    if not hub:
+        raise HTTPException(status_code=404, detail="Hub not found")
+
+    supplier = db.query(Supplier).filter(Supplier.supplier_id == req.supplier_id).first()
+    if not supplier or supplier.hub_id != hub.hub_id:
+        raise HTTPException(status_code=400, detail="Supplier does not belong to this hub")
+
+    if not req.items:
+        raise HTTPException(status_code=400, detail="Order must contain at least one item")
+
+    order_items = []
+    total_cents = 0
+    for line in req.items:
+        item = db.query(MenuItem).filter(MenuItem.item_id == line.item_id).first()
+        if not item or not item.available or item.supplier_id != supplier.supplier_id:
+            raise HTTPException(status_code=400, detail=f"Item {line.item_id} unavailable")
+        if line.qty < 1:
+            raise HTTPException(status_code=400, detail="Quantity must be >= 1")
+        order_items.append(
+            {"item_id": item.item_id, "name": item.name, "qty": line.qty, "price_cents": item.price_cents}
+        )
+        total_cents += item.price_cents * line.qty
+
+    # Prototype scope: destination hub == origin hub (single hub-to-hub route).
+    # Kept as a separate field so multi-hub routing is a config change, not a schema change.
+    order = Order(
+        order_id=f"ord_{uuid.uuid4().hex[:10]}",
+        origin_hub_id=hub.hub_id,
+        destination_hub_id=hub.hub_id,
+        supplier_id=supplier.supplier_id,
+        customer_id=customer_id,
+        items=order_items,
+        total_cents=total_cents,
+        status=OrderStatus.placed,
+    )
+    db.add(order)
+    db.commit()
+    db.refresh(order)
+    return order_to_out(order, db)
+
+
+@app.get("/orders/{order_id}", response_model=schemas.OrderOut)
+def get_order(order_id: str, db: Session = Depends(get_db)):
+    order = db.query(Order).filter(Order.order_id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    return order_to_out(order, db)
+
+
+@app.get("/orders/{order_id}/status", response_model=schemas.OrderStatusOut)
+def get_order_status(order_id: str, db: Session = Depends(get_db)):
+    """Lightweight endpoint for the customer app to poll (every ~3s)."""
+    order = db.query(Order).filter(Order.order_id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+
+    updated_at = next(
+        (getattr(order, f) for f in
+         ["delivered_at", "in_flight_at", "dispatched_at", "preparing_at", "accepted_at", "placed_at"]
+         if getattr(order, f) is not None),
+        None,
+    )
+    return schemas.OrderStatusOut(
+        order_id=order.order_id, status=order.status, drone_id=order.drone_id, updated_at=updated_at
+    )
+
+
+# ===========================================================================
+# SUPPLIER-FACING ENDPOINTS
+# ===========================================================================
+
+@app.get("/supplier/orders", response_model=List[schemas.OrderOut])
+def list_incoming_orders(
+    db: Session = Depends(get_db),
+    supplier_id: str = Depends(require_supplier),
+):
+    """
+    Incoming queue: everything not yet delivered/cancelled for this supplier.
+    Prototype has one supplier, but this already scopes by supplier_id so it's
+    correct once there are more.
+    """
+    orders = (
+        db.query(Order)
+        .filter(
+            Order.supplier_id == supplier_id,
+            Order.status.notin_([OrderStatus.delivered, OrderStatus.cancelled]),
+        )
+        .order_by(Order.placed_at.asc())
+        .all()
+    )
+    return [order_to_out(o, db) for o in orders]
+
+
+@app.post("/supplier/orders/{order_id}/accept", response_model=schemas.OrderOut)
+def accept_order(order_id: str, db: Session = Depends(get_db), supplier_id: str = Depends(require_supplier)):
+    order = _get_supplier_order(db, order_id, supplier_id)
+    return order_to_out(transition(order, OrderStatus.accepted, db), db)
+
+
+@app.post("/supplier/orders/{order_id}/mark-prepared", response_model=schemas.OrderOut)
+def mark_prepared(order_id: str, db: Session = Depends(get_db), supplier_id: str = Depends(require_supplier)):
+    order = _get_supplier_order(db, order_id, supplier_id)
+    # Allow calling mark-prepared directly from 'placed' too (auto-accept) to keep
+    # the supplier UI to a single obvious button per prototype requirement.
+    if order.status == OrderStatus.placed:
+        transition(order, OrderStatus.accepted, db)
+    return order_to_out(transition(order, OrderStatus.preparing, db), db)
+
+
+@app.post("/supplier/orders/{order_id}/bind-drone-and-dispatch", response_model=schemas.OrderOut)
+def bind_drone_and_dispatch(
+    order_id: str,
+    req: schemas.BindDroneRequest,
+    db: Session = Depends(get_db),
+    supplier_id: str = Depends(require_supplier),
+):
+    order = _get_supplier_order(db, order_id, supplier_id)
+    if order.status != OrderStatus.preparing:
+        raise HTTPException(status_code=409, detail="Order must be 'preparing' before dispatch")
+
+    # Drone QR is expected as "DRONE:<drone_id>" — parse defensively.
+    payload = req.drone_qr_payload.strip()
+    drone_id = payload.split(":", 1)[1].strip() if ":" in payload else payload
+    if not drone_id:
+        raise HTTPException(status_code=400, detail="Could not parse drone_id from QR payload")
+
+    order.drone_id = drone_id
+    db.commit()
+    db.refresh(order)
+    return order_to_out(transition(order, OrderStatus.dispatched, db), db)
+
+
+@app.post("/supplier/orders/{order_id}/mark-in-flight", response_model=schemas.OrderOut)
+def mark_in_flight(order_id: str, db: Session = Depends(get_db), supplier_id: str = Depends(require_supplier)):
+    """
+    Called by the flight-side system (or manually in this prototype) once the
+    drone actually lifts off. Kept separate from dispatch since 'dispatched'
+    (handed to drone) and 'in_flight' (airborne) are different real-world moments.
+    """
+    order = _get_supplier_order(db, order_id, supplier_id)
+    return order_to_out(transition(order, OrderStatus.in_flight, db), db)
+
+
+@app.post("/supplier/orders/{order_id}/mark-delivered", response_model=schemas.OrderOut)
+def mark_delivered(order_id: str, db: Session = Depends(get_db), supplier_id: str = Depends(require_supplier)):
+    order = _get_supplier_order(db, order_id, supplier_id)
+    return order_to_out(transition(order, OrderStatus.delivered, db), db)
+
+
+@app.post("/supplier/orders/{order_id}/cancel", response_model=schemas.OrderOut)
+def cancel_order(order_id: str, db: Session = Depends(get_db), supplier_id: str = Depends(require_supplier)):
+    order = _get_supplier_order(db, order_id, supplier_id)
+    return order_to_out(transition(order, OrderStatus.cancelled, db), db)
+
+
+def _get_supplier_order(db: Session, order_id: str, supplier_id: str) -> Order:
+    order = db.query(Order).filter(Order.order_id == order_id).first()
+    if not order:
+        raise HTTPException(status_code=404, detail="Order not found")
+    if order.supplier_id != supplier_id:
+        raise HTTPException(status_code=403, detail="Order does not belong to this supplier")
+    return order
+
+
+@app.get("/health")
+def health():
+    return {"ok": True}
