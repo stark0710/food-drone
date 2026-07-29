@@ -328,6 +328,32 @@ def _get_supplier_order(db: Session, order_id: str, supplier_id: str) -> Order:
     return order
 
 
+@app.get("/drones/{drone_id}/assignment")
+def get_drone_assignment(drone_id: str, db: Session = Depends(get_db)):
+    order = (
+        db.query(Order)
+        .filter(
+            Order.drone_id == drone_id,
+            Order.status.in_([OrderStatus.dispatched, OrderStatus.in_flight]),
+        )
+        .order_by(Order.dispatched_at.desc())
+        .first()
+    )
+    if not order:
+        return {"has_assignment": False}
+
+    destination_hub = db.query(Hub).filter(Hub.hub_id == order.destination_hub_id).first()
+    return {
+        "has_assignment": True,
+        "order_id": order.order_id,
+        "status": order.status,
+        "destination_hub_id": order.destination_hub_id,
+        "destination_hub_name": destination_hub.name if destination_hub else None,
+        "destination_lat": destination_hub.gps_lat if destination_hub else None,
+        "destination_lng": destination_hub.gps_lng if destination_hub else None,
+    }
+
+
 @app.get("/health")
 def health():
     return {"ok": True}
