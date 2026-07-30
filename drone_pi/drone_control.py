@@ -157,6 +157,73 @@ def connect_mavlink():
     return conn
 
 
+def capture_launch_home(conn):
+    """
+    Records the vehicle's CURRENT position as the true launch-pad home,
+    once, at script startup (before anything has flown or re-armed).
+
+    This matters because ArduCopter re-records its home position at every
+    single arm event, not just the first. Our return leg arms the vehicle
+    again while it's sitting at the destination (needed to trigger a real
+    takeoff via GUIDED, since RTL can't be armed into directly) - and that
+    re-arm silently resets "home" to the destination itself. Without this
+    capture, RTL then just flies the vehicle a few meters up and back down
+    at the same spot it's already at, instead of actually going home -
+    exactly what was observed before this fix.
+
+    Requests HOME_POSITION explicitly rather than waiting for it to stream,
+    since SITL doesn't always push it unprompted right at startup.
+    """
+    conn.mav.command_long_send(
+        conn.target_system, conn.target_component,
+        mavutil.mavlink.MAV_CMD_REQUEST_MESSAGE,
+        0,
+        mavutil.mavlink.MAVLINK_MSG_ID_HOME_POSITION,
+        0, 0, 0, 0, 0, 0,
+    )
+    msg = conn.recv_match(type="HOME_POSITION", blocking=True, timeout=10)
+    if msg is None:
+        print(f"[{ts()}] [mavlink] WARNING: no HOME_POSITION received - return-leg home "
+              f"correction will be skipped, RTL may return to the wrong place")
+        return None
+    home = {
+        "lat": msg.latitude / 1e7,
+        "lng": msg.longitude / 1e7,
+        "alt": msg.altitude / 1000.0,
+    }
+    print(f"[{ts()}] [mavlink] captured true launch-pad home: {home['lat']}, {home['lng']} @ {home['alt']}m")
+    return home
+
+
+def restore_launch_home(conn, home):
+    """
+    Explicitly re-sets home to the saved launch-pad coordinates. Called
+    right before triggering the return leg's RTL, to undo the automatic
+    home-reset that happens when we re-arm the vehicle at the destination.
+    """
+    if home is None:
+        print(f"[{ts()}] [mavlink] no saved launch home available - skipping home restore, "
+              f"RTL will use wherever ArduCopter currently thinks home is")
+        return False
+
+    conn.mav.command_long_send(
+        conn.target_system, conn.target_component,
+        mavutil.mavlink.MAV_CMD_DO_SET_HOME,
+        0,
+        0,  # param1: 0 = use the specified location below, not current position
+        0, 0, 0,  # param2-4 unused
+        home["lat"], home["lng"], home["alt"],
+    )
+    ack = conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=5)
+    if ack and ack.command == mavutil.mavlink.MAV_CMD_DO_SET_HOME and ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+        print(f"[{ts()}] [mavlink] home restored to launch pad: {home['lat']}, {home['lng']}")
+        return True
+    else:
+        print(f"[{ts()}] [mavlink] WARNING: DO_SET_HOME not accepted (ack={ack}) - "
+              f"RTL may still return to the wrong place")
+        return False
+
+
 def upload_mission(conn, lat, lng, altitude_m):
     """
     Uploads a 4-item mission: a placeholder at seq 0, then NAV_TAKEOFF to
@@ -421,7 +488,7 @@ class FlightState:
 
             self.armed_prev = False
 
-    def maybe_launch_return(self, conn):
+    def maybe_launch_return(self, conn, launch_home):
         if self.leg != "awaiting_return" or self.dwell_until is None:
             return
         if time.time() < self.dwell_until:
@@ -431,10 +498,11 @@ class FlightState:
             self.leg = "return"
             self.dwell_until = None
             return
-        # RTL is a built-in ArduCopter mode - the flight controller already
-        # knows its own home position (recorded automatically at first arm)
-        # and handles climb-out, navigate-home, descent, and landing on its
-        # own. No mission upload needed for the return leg.
+        # The return leg's takeoff re-arms the vehicle at the destination,
+        # which resets ArduCopter's recorded home to right here. Restore
+        # the real launch-pad coordinates first, or RTL will just fly a
+        # few meters up and back down at the destination it's already at.
+        restore_launch_home(conn, launch_home)
         if launch_return_leg(conn, CRUISE_ALTITUDE_M):
             self.leg = "return"
             self.dwell_until = None
@@ -449,6 +517,7 @@ class FlightState:
 
 def main():
     conn = connect_mavlink()
+    launch_home = capture_launch_home(conn)
     print(f"[{ts()}] [poll] watching {API_BASE_URL}/drones/{DRONE_ID}/assignment every {POLL_INTERVAL_SECONDS}s")
     state = FlightState()
     had_assignment = False
@@ -500,7 +569,7 @@ def main():
                 elif t == "STATUSTEXT":
                     state.handle_statustext(msg)
 
-            state.maybe_launch_return(conn)
+            state.maybe_launch_return(conn, launch_home)
 
     except KeyboardInterrupt:
         pass
