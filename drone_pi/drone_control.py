@@ -95,10 +95,18 @@ LED_PIN = 17  # BCM numbering, GPIO17 = physical pin 11
 # ArduCopter custom_mode numbers (from the ArduCopter flight-mode enum,
 # not a general MAVLink constant).
 COPTER_MODE_AUTO = 3
+COPTER_MODE_GUIDED = 4
 COPTER_MODE_RTL = 6
 LAND_ITEM_SEQ = 3  # index of the LAND command in the fixed 4-item mission
                     # built by upload_mission() (0=home placeholder,
                     # 1=takeoff, 2=waypoint, 3=land)
+
+# Number of consecutive disarmed heartbeats required before a "disarmed"
+# transition is treated as real. Heartbeats arrive roughly 1/sec, so 3
+# means a landing/abort is confirmed within ~2-3s - long enough to reject
+# a single flaky/out-of-order packet, short enough not to meaningfully
+# delay reporting a genuine delivery.
+DISARM_CONFIRM_COUNT = 3
 
 try:
     import RPi.GPIO as GPIO
@@ -186,6 +194,66 @@ def upload_mission(conn, lat, lng, altitude_m):
         return False
 
 
+def launch_return_leg(conn, altitude_m):
+    """
+    ArduCopter refuses to arm directly into RTL mode from the ground
+    ("Arm: RTL mode not armable") - RTL only makes sense as a mode to
+    switch INTO while already flying, not as a takeoff mode. An earlier
+    version of this script called arm_and_set_mode(conn, COPTER_MODE_RTL,
+    ...) for the return leg, which always got rejected for this reason -
+    the vehicle just sat there disarmed at the destination forever.
+
+    Correct sequence: arm in GUIDED, command an explicit takeoff, wait for
+    it to actually leave the ground, THEN switch to RTL. Once in RTL,
+    ArduCopter handles the climb-to-RTL_ALT, navigate home, descent, and
+    landing on its own.
+    """
+    conn.mav.set_mode_send(
+        conn.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        COPTER_MODE_GUIDED,
+    )
+    time.sleep(1)
+
+    conn.mav.command_long_send(
+        conn.target_system, conn.target_component,
+        mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
+        0, 1, 0, 0, 0, 0, 0, 0,
+    )
+    arm_ack = conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=5)
+    if not (arm_ack and arm_ack.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM
+            and arm_ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED):
+        print(f"[{ts()}] [mavlink] *** ARM REJECTED for return leg (GUIDED): ack={arm_ack} - "
+              f"check STATUSTEXT above for the PreArm reason ***")
+        return False
+    print(f"[{ts()}] [mavlink] return leg armed in GUIDED")
+
+    conn.mav.command_long_send(
+        conn.target_system, conn.target_component,
+        mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        0, 0, 0, 0, 0, 0, 0, altitude_m,
+    )
+    takeoff_ack = conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=5)
+    if not (takeoff_ack and takeoff_ack.command == mavutil.mavlink.MAV_CMD_NAV_TAKEOFF
+            and takeoff_ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED):
+        print(f"[{ts()}] [mavlink] *** TAKEOFF REJECTED for return leg: ack={takeoff_ack} ***")
+        return False
+    print(f"[{ts()}] [mavlink] return-leg takeoff accepted, climbing to {altitude_m}m before switching to RTL")
+
+    # Give it a few seconds to actually leave the ground before handing off
+    # to RTL - switching mode the instant takeoff is merely ACCEPTED (not
+    # yet executed) can race with the climb.
+    time.sleep(5)
+
+    conn.mav.set_mode_send(
+        conn.target_system,
+        mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
+        COPTER_MODE_RTL,
+    )
+    print(f"[{ts()}] [mavlink] return leg: mode set to RTL - ArduCopter will navigate home and land on its own")
+    return True
+
+
 def arm_and_set_mode(conn, mode_id: int, mode_name: str):
     """Arms the vehicle and switches it to the given custom_mode. Used for
     both outbound auto-launch (AUTO) and return (RTL), depending on which
@@ -263,6 +331,7 @@ class FlightState:
         self.last_progress_print = 0.0
         self.reached_land_seq = False  # was MISSION_ITEM_REACHED seen for the LAND item?
         self.land_item_seq = None      # set by main() right after each upload_mission() call
+        self._disarmed_streak = 0      # consecutive heartbeats reporting disarmed since last armed
 
     def handle_mission_item_reached(self, msg):
         if self.leg not in ("outbound", "return"):
@@ -295,14 +364,29 @@ class FlightState:
     def handle_heartbeat(self, conn, msg):
         armed_now = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
-        if armed_now and not self.armed_prev:
-            if self.leg == "outbound":
-                print(f"[{ts()}] [flight] outbound leg armed/launched")
-                notify_backend("report-in-flight")
-            elif self.leg == "return":
-                print(f"[{ts()}] [flight] return leg armed/launched")
+        if armed_now:
+            self._disarmed_streak = 0
+            if not self.armed_prev:
+                if self.leg == "outbound":
+                    print(f"[{ts()}] [flight] outbound leg armed/launched")
+                    notify_backend("report-in-flight")
+                elif self.leg == "return":
+                    print(f"[{ts()}] [flight] return leg armed/launched")
+            self.armed_prev = True
+            return
 
-        if (not armed_now) and self.armed_prev:
+        # armed_now is False from here on. Don't act on a single disarmed
+        # reading - a solitary flaky/out-of-order heartbeat right after
+        # arming was previously enough to make the script think the
+        # vehicle had landed 2 seconds into a 3-minute flight, even though
+        # ArduCopter kept flying the real mission to completion regardless.
+        # Require DISARM_CONFIRM_COUNT consecutive disarmed heartbeats
+        # before treating it as real.
+        if self.armed_prev:
+            self._disarmed_streak += 1
+            if self._disarmed_streak < DISARM_CONFIRM_COUNT:
+                return  # not confirmed yet, wait for more heartbeats
+
             if self.leg == "outbound":
                 if self.reached_land_seq:
                     print(f"[{ts()}] [flight] landed at destination - delivery complete")
@@ -325,7 +409,7 @@ class FlightState:
                 print(f"[{ts()}] [flight] landed back at home - round trip complete")
                 self.leg = None
 
-        self.armed_prev = armed_now
+            self.armed_prev = False
 
     def maybe_launch_return(self, conn):
         if self.leg != "awaiting_return" or self.dwell_until is None:
@@ -341,15 +425,15 @@ class FlightState:
         # knows its own home position (recorded automatically at first arm)
         # and handles climb-out, navigate-home, descent, and landing on its
         # own. No mission upload needed for the return leg.
-        if arm_and_set_mode(conn, COPTER_MODE_RTL, "RTL"):
+        if launch_return_leg(conn, CRUISE_ALTITUDE_M):
             self.leg = "return"
             self.dwell_until = None
         else:
-            # Arm was rejected (see the ARM REJECTED / STATUSTEXT lines
-            # above for why - most likely PreArm/geofence). Stay in
-            # "awaiting_return" and retry in 10s rather than giving up
-            # silently and leaving the vehicle stranded at the destination.
-            print(f"[{ts()}] [flight] return-leg arm failed, will retry in 10s")
+            # Arm/takeoff was rejected (see the ARM/TAKEOFF REJECTED /
+            # STATUSTEXT lines above for why - most likely PreArm/geofence).
+            # Stay in "awaiting_return" and retry in 10s rather than giving
+            # up silently and leaving the vehicle stranded at the destination.
+            print(f"[{ts()}] [flight] return-leg launch failed, will retry in 10s")
             self.dwell_until = time.time() + 10
 
 
