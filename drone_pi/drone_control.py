@@ -96,6 +96,9 @@ LED_PIN = 17  # BCM numbering, GPIO17 = physical pin 11
 # not a general MAVLink constant).
 COPTER_MODE_AUTO = 3
 COPTER_MODE_RTL = 6
+LAND_ITEM_SEQ = 3  # index of the LAND command in the fixed 4-item mission
+                    # built by upload_mission() (0=home placeholder,
+                    # 1=takeoff, 2=waypoint, 3=land)
 
 try:
     import RPi.GPIO as GPIO
@@ -236,6 +239,23 @@ class FlightState:
         self.leg = None  # None | "outbound" | "awaiting_return" | "return"
         self.dwell_until = None
         self.last_progress_print = 0.0
+        self.reached_land_seq = False  # was MISSION_ITEM_REACHED seen for the LAND item?
+        self.land_item_seq = None      # set by main() right after each upload_mission() call
+
+    def handle_mission_item_reached(self, msg):
+        if self.leg not in ("outbound", "return"):
+            return
+        print(f"[{ts()}] [progress] leg={self.leg} mission item reached: seq={msg.seq}")
+        if self.land_item_seq is not None and msg.seq == self.land_item_seq:
+            self.reached_land_seq = True
+
+    def handle_statustext(self, msg):
+        # ArduPilot pushes fence breaches, failsafe triggers, arming
+        # failures etc. here as free text - this is the message type that
+        # will actually say *why* a leg went to RTL early (e.g. "Failsafe:
+        # GCS", "Fence breached"). Always worth printing, not just on error.
+        text = msg.text if isinstance(msg.text, str) else msg.text.decode("utf-8", "ignore")
+        print(f"[{ts()}] [vehicle] {text.rstrip(chr(0))}")
 
     def handle_nav_controller_output(self, msg):
         """Prints periodic distance-to-waypoint/altitude while airborne, so
@@ -262,10 +282,23 @@ class FlightState:
 
         if (not armed_now) and self.armed_prev:
             if self.leg == "outbound":
-                print(f"[{ts()}] [flight] landed at destination - delivery complete")
-                notify_backend("report-delivered")
-                self.dwell_until = time.time() + UNLOAD_DWELL_SECONDS
-                self.leg = "awaiting_return"
+                if self.reached_land_seq:
+                    print(f"[{ts()}] [flight] landed at destination - delivery complete")
+                    notify_backend("report-delivered")
+                    self.dwell_until = time.time() + UNLOAD_DWELL_SECONDS
+                    self.leg = "awaiting_return"
+                else:
+                    # Disarmed without ever reaching the LAND item - this is
+                    # an abort (failsafe RTL, fence breach, manual override,
+                    # etc.), not a delivery. Do NOT report delivered and do
+                    # NOT auto-relaunch anything: check the [vehicle]
+                    # STATUSTEXT lines above for the actual reason, fix it,
+                    # then dispatch a fresh assignment once it's sorted.
+                    print(f"[{ts()}] [flight] *** ABORT: disarmed without reaching destination "
+                          f"(never saw mission item {self.land_item_seq} reached). Check STATUSTEXT "
+                          f"lines above for the failsafe/fence reason. NOT reporting delivered, "
+                          f"NOT auto-relaunching. ***")
+                    self.leg = None
             elif self.leg == "return":
                 print(f"[{ts()}] [flight] landed back at home - round trip complete")
                 self.leg = None
@@ -312,6 +345,8 @@ def main():
                     if lat is not None and lng is not None:
                         if upload_mission(conn, lat, lng, CRUISE_ALTITUDE_M):
                             state.leg = "outbound"
+                            state.land_item_seq = LAND_ITEM_SEQ
+                            state.reached_land_seq = False
                             if AUTO_LAUNCH_OUTBOUND_ENABLED:
                                 arm_and_set_mode(conn, COPTER_MODE_AUTO, "AUTO")
                             else:
@@ -322,12 +357,20 @@ def main():
                 elif not had_assignment:
                     led_off()
 
-            msg = conn.recv_match(type=["HEARTBEAT", "NAV_CONTROLLER_OUTPUT"], blocking=True, timeout=0.5)
+            msg = conn.recv_match(
+                type=["HEARTBEAT", "NAV_CONTROLLER_OUTPUT", "MISSION_ITEM_REACHED", "STATUSTEXT"],
+                blocking=True, timeout=0.5,
+            )
             if msg is not None:
-                if msg.get_type() == "HEARTBEAT":
+                t = msg.get_type()
+                if t == "HEARTBEAT":
                     state.handle_heartbeat(conn, msg)
-                elif msg.get_type() == "NAV_CONTROLLER_OUTPUT":
+                elif t == "NAV_CONTROLLER_OUTPUT":
                     state.handle_nav_controller_output(msg)
+                elif t == "MISSION_ITEM_REACHED":
+                    state.handle_mission_item_reached(msg)
+                elif t == "STATUSTEXT":
+                    state.handle_statustext(msg)
 
             state.maybe_launch_return(conn)
 
