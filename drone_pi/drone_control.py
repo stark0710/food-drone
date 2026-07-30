@@ -189,7 +189,16 @@ def upload_mission(conn, lat, lng, altitude_m):
 def arm_and_set_mode(conn, mode_id: int, mode_name: str):
     """Arms the vehicle and switches it to the given custom_mode. Used for
     both outbound auto-launch (AUTO) and return (RTL), depending on which
-    caller invokes it and whether the relevant *_ENABLED flag allows it."""
+    caller invokes it and whether the relevant *_ENABLED flag allows it.
+
+    Returns True only if the vehicle actually ACKed the arm command with
+    MAV_RESULT_ACCEPTED. Previously this function fired the arm command and
+    assumed it worked - if ArduCopter's PreArm checks rejected it (e.g. a
+    geofence breach because the vehicle is now sitting at the destination
+    hub, far from where the fence is centered), the script had no way of
+    knowing and would just sit there forever waiting for an armed
+    heartbeat that was never coming.
+    """
     conn.mav.set_mode_send(
         conn.target_system,
         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
@@ -201,7 +210,20 @@ def arm_and_set_mode(conn, mode_id: int, mode_name: str):
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
         0, 1, 0, 0, 0, 0, 0, 0,
     )
-    print(f"[{ts()}] [mavlink] auto-launch: mode set to {mode_name}, arm command sent")
+    ack = conn.recv_match(type="COMMAND_ACK", blocking=True, timeout=5)
+    if ack and ack.command == mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM:
+        if ack.result == mavutil.mavlink.MAV_RESULT_ACCEPTED:
+            print(f"[{ts()}] [mavlink] mode set to {mode_name}, arm ACCEPTED")
+            return True
+        else:
+            print(f"[{ts()}] [mavlink] *** ARM REJECTED for {mode_name}: MAV_RESULT={ack.result} - "
+                  f"check the [vehicle] STATUSTEXT line just above/below this for the specific PreArm "
+                  f"reason (common cause: geofence enabled and vehicle is outside it at this location) ***")
+            return False
+    else:
+        print(f"[{ts()}] [mavlink] *** ARM command got no ACK within 5s for {mode_name} - "
+              f"connection issue or vehicle unresponsive ***")
+        return False
 
 
 def notify_backend(path):
@@ -310,17 +332,25 @@ class FlightState:
             return
         if time.time() < self.dwell_until:
             return
-        self.leg = "return"
-        self.dwell_until = None
-        if AUTO_RETURN_ENABLED:
-            # RTL is a built-in ArduCopter mode - the flight controller
-            # already knows its own home position (recorded automatically
-            # at the moment it was first armed) and handles climb-out,
-            # navigate-home, descent, and landing on its own. No mission
-            # upload or coordinate tracking needed from this script at all.
-            arm_and_set_mode(conn, COPTER_MODE_RTL, "RTL")
-        else:
+        if not AUTO_RETURN_ENABLED:
             print(f"[{ts()}] [flight] awaiting return - AUTO_RETURN_ENABLED=False, waiting for human to arm+RTL manually")
+            self.leg = "return"
+            self.dwell_until = None
+            return
+        # RTL is a built-in ArduCopter mode - the flight controller already
+        # knows its own home position (recorded automatically at first arm)
+        # and handles climb-out, navigate-home, descent, and landing on its
+        # own. No mission upload needed for the return leg.
+        if arm_and_set_mode(conn, COPTER_MODE_RTL, "RTL"):
+            self.leg = "return"
+            self.dwell_until = None
+        else:
+            # Arm was rejected (see the ARM REJECTED / STATUSTEXT lines
+            # above for why - most likely PreArm/geofence). Stay in
+            # "awaiting_return" and retry in 10s rather than giving up
+            # silently and leaving the vehicle stranded at the destination.
+            print(f"[{ts()}] [flight] return-leg arm failed, will retry in 10s")
+            self.dwell_until = time.time() + 10
 
 
 def main():
@@ -348,7 +378,11 @@ def main():
                             state.land_item_seq = LAND_ITEM_SEQ
                             state.reached_land_seq = False
                             if AUTO_LAUNCH_OUTBOUND_ENABLED:
-                                arm_and_set_mode(conn, COPTER_MODE_AUTO, "AUTO")
+                                if not arm_and_set_mode(conn, COPTER_MODE_AUTO, "AUTO"):
+                                    print(f"[{ts()}] [warn] outbound arm was rejected - mission is uploaded "
+                                          f"and waiting, but nothing will launch until this is armed "
+                                          f"(manually via Mission Planner, or fix the PreArm issue and "
+                                          f"this will still be picked up next time you retry)")
                             else:
                                 print(f"[{ts()}] [flight] mission uploaded - waiting for human to arm+AUTO (AUTO_LAUNCH_OUTBOUND_ENABLED=False)")
                     else:
