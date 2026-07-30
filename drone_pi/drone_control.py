@@ -131,22 +131,29 @@ def connect_mavlink():
 
 def upload_mission(conn, lat, lng, altitude_m):
     """
-    Uploads a 3-item mission: NAV_TAKEOFF to altitude_m, NAV_WAYPOINT at the
-    given coordinates, then NAV_LAND at the same coordinates.
+    Uploads a 4-item mission: a placeholder at seq 0, then NAV_TAKEOFF to
+    altitude_m, NAV_WAYPOINT at the given coordinates, then NAV_LAND at the
+    same coordinates.
 
-    The takeoff item is required, not optional - ArduCopter's AUTO mode
-    refuses to arm from the ground ("Auto: Missing Takeoff Cmd") unless the
-    first mission item is a takeoff command. The land item is required for
-    the vehicle to actually touch down instead of loitering forever over
-    the destination.
+    IMPORTANT: seq 0 in the ArduPilot/MAVLink mission protocol is always
+    treated as the home-position placeholder - whatever command you put
+    there gets silently discarded/ignored by the flight controller, which
+    substitutes its own recorded home info instead. Real commands have to
+    start at seq 1. An earlier version of this script put NAV_TAKEOFF at
+    seq 0, which the FC quietly dropped - the mission still "uploaded and
+    accepted" (no error), but the takeoff command was gone, which is why
+    AUTO mode refused to arm ("Missing Takeoff Cmd") even though the
+    upload appeared to succeed.
     """
     items = [
         # (seq, frame, command, current, autocontinue, p1, p2, p3, p4, x, y, z)
-        (0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
+        (0, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+         0, 1, 0, 0, 0, 0, 0, 0, 0),  # seq 0 placeholder - content ignored by the FC, home info substituted
+        (1, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, mavutil.mavlink.MAV_CMD_NAV_TAKEOFF,
          0, 1, 0, 0, 0, 0, 0, 0, altitude_m),
-        (1, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
+        (2, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, mavutil.mavlink.MAV_CMD_NAV_WAYPOINT,
          0, 1, 0, 0, 0, 0, int(lat * 1e7), int(lng * 1e7), altitude_m),
-        (2, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, mavutil.mavlink.MAV_CMD_NAV_LAND,
+        (3, mavutil.mavlink.MAV_FRAME_GLOBAL_RELATIVE_ALT_INT, mavutil.mavlink.MAV_CMD_NAV_LAND,
          0, 1, 0, 0, 0, 0, int(lat * 1e7), int(lng * 1e7), 0),
     ]
 
