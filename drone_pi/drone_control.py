@@ -7,35 +7,45 @@ FLIGHT LIFECYCLE (per assignment):
   1. Poll backend for a new assignment.
   2. On a new assignment: upload a 3-item OUTBOUND mission
      (TAKEOFF -> WAYPOINT -> LAND at the destination).
-  3. Wait for a HUMAN to arm + switch to AUTO (via RC or Mission Planner).
-     This script still does NOT arm or change mode for the outbound leg -
-     someone has to physically launch it. That part of the original design
-     is unchanged.
-  4. Once armed+AUTO is detected -> tell the backend the order is "in_flight".
+  3. If AUTO_LAUNCH_OUTBOUND_ENABLED (default True): the Pi itself arms and
+     switches to AUTO immediately - fully autonomous, no human involved.
+     Set this False to go back to the original design where a human must
+     arm + switch to AUTO manually via RC or Mission Planner.
+  4. Once armed+AUTO is detected (however it happened) -> tell the backend
+     the order is "in_flight".
   5. Once the vehicle disarms after that (i.e. it landed at the
      destination) -> tell the backend the order is "delivered", then wait
      UNLOAD_DWELL_SECONDS (simulates/allows time for unloading).
-  6. Build a return mission back to the recorded home position
-     (TAKEOFF -> WAYPOINT -> LAND), upload it, and this time the Pi ITSELF
-     arms and switches to AUTO -> fully autonomous return, no human input.
+  6. If AUTO_RETURN_ENABLED (default True): arm and switch to ArduCopter's
+     native RTL mode - the flight controller handles climb-out, navigate
+     home, descent, and landing entirely on its own using the home
+     position it recorded automatically at first arm. No mission upload or
+     coordinate tracking needed from this script for the return leg at all.
   7. Once it disarms again (back home) -> ready for the next assignment.
 
 >>> SAFETY - READ BEFORE RUNNING ON REAL HARDWARE <<<
-Step 6 is a real change from the earlier version of this script, which
-never armed or changed mode under any circumstances. From here on, the Pi
-will autonomously arm a real aircraft and fly it home with no one holding
-a transmitter. Before ever enabling AUTO_RETURN_ENABLED against a physical
-Pixhawk:
+With both AUTO_LAUNCH_OUTBOUND_ENABLED and AUTO_RETURN_ENABLED True (the
+default), this script arms and flies a real aircraft with ZERO human
+involvement at any point in the round trip - a bigger step than the
+original design, where at minimum a human had to physically launch the
+outbound leg. Before ever running this against a real Pixhawk:
   - Confirm geofence is configured and enabled (Config -> Geofence).
   - Confirm failsafes are configured (Config -> Failsafe: RC loss, battery,
-    GCS loss, EKF) so a bad return leg fails safe instead of just flying
-    off.
+    GCS loss, EKF) so a bad leg fails safe instead of just flying off.
   - Test the entire round trip repeatedly in SITL first.
   - Consider keeping a human with a transmitter in RC-override range for
     early real-world flights even though the software no longer requires
     one.
+  - The re-arm/re-launch moment after landing at a destination (whether
+    outbound auto-launch or the return leg) is the highest-risk point in
+    this whole design - nothing here confirms the area around the landed
+    aircraft is actually clear of people before it takes off again. A
+    fixed dwell timer (UNLOAD_DWELL_SECONDS) is not a real safety check;
+    for anything beyond SITL testing, that needs to become an actual
+    clear-to-launch confirmation (a physical button, a camera check, etc.),
+    not just "enough seconds have passed."
 This script has no knowledge of your fence/failsafe setup and will happily
-arm and fly home even if you haven't configured either.
+arm and fly with either flag True even if you haven't configured either.
 
 Requires: pip install pymavlink requests
 On a real Pi, also: pip install RPi.GPIO
@@ -62,15 +72,23 @@ UNLOAD_DWELL_SECONDS = 15  # time to sit landed at the destination before
                             # auto-launching the return leg. Tune to how
                             # long unloading actually takes.
 
+# Set False to require a human to arm+AUTO the OUTBOUND leg (original
+# design). Set True and the Pi arms and launches the outbound leg itself
+# the moment a mission uploads successfully - no human involved at all,
+# for either leg. Read the safety note above before setting this True
+# against real hardware.
+AUTO_LAUNCH_OUTBOUND_ENABLED = True
+
 # Set False to keep the return leg manual too (mission gets uploaded, but
 # the Pi will wait for a human to arm it, same as the outbound leg).
 AUTO_RETURN_ENABLED = True
 
 LED_PIN = 17  # BCM numbering, GPIO17 = physical pin 11
 
-# ArduCopter custom_mode numbers we care about (from the ArduCopter
-# flight-mode enum, not a general MAVLink constant).
+# ArduCopter custom_mode numbers (from the ArduCopter flight-mode enum,
+# not a general MAVLink constant).
 COPTER_MODE_AUTO = 3
+COPTER_MODE_RTL = 6
 
 try:
     import RPi.GPIO as GPIO
@@ -151,13 +169,14 @@ def upload_mission(conn, lat, lng, altitude_m):
         return False
 
 
-def arm_and_start_auto(conn):
-    """Autonomously arms the vehicle and switches it to AUTO. Only ever
-    called for the RETURN leg - the outbound leg is still human-armed."""
+def arm_and_set_mode(conn, mode_id: int, mode_name: str):
+    """Arms the vehicle and switches it to the given custom_mode. Used for
+    both outbound auto-launch (AUTO) and return (RTL), depending on which
+    caller invokes it and whether the relevant *_ENABLED flag allows it."""
     conn.mav.set_mode_send(
         conn.target_system,
         mavutil.mavlink.MAV_MODE_FLAG_CUSTOM_MODE_ENABLED,
-        COPTER_MODE_AUTO,
+        mode_id,
     )
     time.sleep(1)
     conn.mav.command_long_send(
@@ -165,7 +184,7 @@ def arm_and_start_auto(conn):
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
         0, 1, 0, 0, 0, 0, 0, 0,
     )
-    print("[mavlink] auto-return: mode set to AUTO, arm command sent")
+    print(f"[mavlink] auto-launch: mode set to {mode_name}, arm command sent")
 
 
 def notify_backend(path):
@@ -200,9 +219,7 @@ class FlightState:
 
     def __init__(self):
         self.armed_prev = False
-        self.leg = None  # None | "outbound" | "return"
-        self.home_lat = None
-        self.home_lng = None
+        self.leg = None  # None | "outbound" | "awaiting_return" | "return"
         self.dwell_until = None
 
     def handle_heartbeat(self, conn, msg):
@@ -227,27 +244,22 @@ class FlightState:
 
         self.armed_prev = armed_now
 
-    def handle_home_position(self, msg):
-        self.home_lat = msg.latitude / 1e7
-        self.home_lng = msg.longitude / 1e7
-
     def maybe_launch_return(self, conn):
         if self.leg != "awaiting_return" or self.dwell_until is None:
             return
         if time.time() < self.dwell_until:
             return
-        if self.home_lat is None:
-            print("[warn] no HOME_POSITION captured yet - can't build return mission, retrying")
-            return
-        if not upload_mission(conn, self.home_lat, self.home_lng, CRUISE_ALTITUDE_M):
-            print("[warn] return mission upload failed, will retry")
-            return
         self.leg = "return"
         self.dwell_until = None
         if AUTO_RETURN_ENABLED:
-            arm_and_start_auto(conn)
+            # RTL is a built-in ArduCopter mode - the flight controller
+            # already knows its own home position (recorded automatically
+            # at the moment it was first armed) and handles climb-out,
+            # navigate-home, descent, and landing on its own. No mission
+            # upload or coordinate tracking needed from this script at all.
+            arm_and_set_mode(conn, COPTER_MODE_RTL, "RTL")
         else:
-            print("[flight] return mission uploaded - waiting for human to arm (AUTO_RETURN_ENABLED=False)")
+            print("[flight] awaiting return - AUTO_RETURN_ENABLED=False, waiting for human to arm+RTL manually")
 
 
 def main():
@@ -272,18 +284,19 @@ def main():
                     if lat is not None and lng is not None:
                         if upload_mission(conn, lat, lng, CRUISE_ALTITUDE_M):
                             state.leg = "outbound"
+                            if AUTO_LAUNCH_OUTBOUND_ENABLED:
+                                arm_and_set_mode(conn, COPTER_MODE_AUTO, "AUTO")
+                            else:
+                                print("[flight] mission uploaded - waiting for human to arm+AUTO (AUTO_LAUNCH_OUTBOUND_ENABLED=False)")
                     else:
                         print("[warn] no destination coordinates on this order - skipping waypoint upload")
                     led_on()
                 elif not had_assignment:
                     led_off()
 
-            msg = conn.recv_match(type=["HEARTBEAT", "HOME_POSITION"], blocking=True, timeout=0.5)
+            msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
             if msg is not None:
-                if msg.get_type() == "HEARTBEAT":
-                    state.handle_heartbeat(conn, msg)
-                elif msg.get_type() == "HOME_POSITION":
-                    state.handle_home_position(msg)
+                state.handle_heartbeat(conn, msg)
 
             state.maybe_launch_return(conn)
 
