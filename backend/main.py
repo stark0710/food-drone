@@ -12,6 +12,7 @@ from database import Base, engine, get_db
 import models
 from models import Order, Hub, Supplier, MenuItem, OrderStatus, ALLOWED_TRANSITIONS
 import schemas
+from sqlalchemy import text, inspect
 
 load_dotenv()
 
@@ -28,6 +29,27 @@ app.add_middleware(
 # Creates tables if they don't exist yet (fine for a 2-week prototype;
 # swap for Alembic migrations if this grows past the prototype stage).
 Base.metadata.create_all(bind=engine)
+
+# create_all() ONLY creates missing tables — it never adds a column to a
+# table that already exists. On Render's free tier there's no Shell tab to
+# run a manual ALTER TABLE (that's a paid-plan feature), so instead: check
+# for and add any newly-needed columns here, every startup. Checking via
+# inspector (rather than "ADD COLUMN IF NOT EXISTS", which is Postgres-only
+# syntax — SQLite errors on it) keeps this working the same way whether
+# you're on Render's Postgres or a local SQLite dev DB. Add an entry here
+# any time a new nullable column shows up in models.py; fine for a
+# prototype, but swap for real Alembic migrations before this grows past
+# that.
+_NEW_ORDER_COLUMNS = {
+    "launch_confirmed_at": "TIMESTAMPTZ" if engine.dialect.name == "postgresql" else "DATETIME",
+    "mission_ack_at": "TIMESTAMPTZ" if engine.dialect.name == "postgresql" else "DATETIME",
+}
+_existing_columns = {c["name"] for c in inspect(engine).get_columns("orders")}
+with engine.connect() as _conn:
+    for _col_name, _col_type in _NEW_ORDER_COLUMNS.items():
+        if _col_name not in _existing_columns:
+            _conn.execute(text(f"ALTER TABLE orders ADD COLUMN {_col_name} {_col_type}"))
+    _conn.commit()
 
 TEST_CUSTOMER_ID = os.getenv("TEST_CUSTOMER_ID", "cust_test_1")
 TEST_CUSTOMER_TOKEN = os.getenv("TEST_CUSTOMER_TOKEN", "customer-dev-token")
