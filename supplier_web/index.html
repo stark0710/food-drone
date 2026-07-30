@@ -28,8 +28,10 @@
         <input id="manual-drone-input" placeholder="e.g. DRONE:drone_042" />
         <button id="manual-drone-submit">Confirm</button>
       </div>
-      <!-- Shown once the drone QR is scanned/entered, replacing the reader
-           while bind-drone-and-dispatch is in flight. -->
+      <!-- Shown once the drone QR is scanned/entered. Dispatch (bind-drone)
+           happens automatically, but the drone does NOT arm/launch until
+           the supplier taps the button below - that's the actual human
+           go/no-go moment, not the QR scan itself. -->
       <div id="route-confirm" class="route-confirm hidden">
         <div class="route-confirm-label">Dispatching to</div>
         <div class="route-confirm-path">
@@ -38,6 +40,7 @@
           <span id="route-confirm-to">—</span>
         </div>
         <div id="route-confirm-status" class="route-confirm-status">Confirming with drone…</div>
+        <button id="confirm-launch-btn" class="launch-btn hidden">🛫 Confirm &amp; Launch</button>
       </div>
       <button id="scan-cancel" class="secondary">Cancel</button>
     </div>

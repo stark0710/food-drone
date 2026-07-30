@@ -83,6 +83,7 @@ def order_to_out(o: Order, db: Session) -> schemas.OrderOut:
         total_cents=o.total_cents,
         status=o.status,
         drone_id=o.drone_id,
+        launch_confirmed_at=o.launch_confirmed_at,
         placed_at=o.placed_at,
         accepted_at=o.accepted_at,
         preparing_at=o.preparing_at,
@@ -296,6 +297,28 @@ def bind_drone_and_dispatch(
     return order_to_out(transition(order, OrderStatus.dispatched, db), db)
 
 
+@app.post("/supplier/orders/{order_id}/confirm-launch", response_model=schemas.OrderOut)
+def confirm_launch(order_id: str, db: Session = Depends(get_db), supplier_id: str = Depends(require_supplier)):
+    """
+    Called when the supplier taps "Confirm & Launch" in the web UI, after
+    bind-drone-and-dispatch. This is the human go/no-go moment: the Pi
+    uploads the mission the instant it's dispatched (inert - no motors),
+    but does NOT arm or take off until it polls /drones/{drone_id}/assignment
+    and sees launch_confirmed=True, which this sets. Doesn't change
+    order.status - the drone itself reports 'in_flight' once it's actually
+    airborne (see report_in_flight below).
+    """
+    order = _get_supplier_order(db, order_id, supplier_id)
+    if order.status != OrderStatus.dispatched:
+        raise HTTPException(status_code=409, detail="Order must be 'dispatched' before confirming launch")
+    if not order.drone_id:
+        raise HTTPException(status_code=409, detail="No drone bound to this order yet")
+    order.launch_confirmed_at = now()
+    db.commit()
+    db.refresh(order)
+    return order_to_out(order, db)
+
+
 @app.post("/supplier/orders/{order_id}/mark-in-flight", response_model=schemas.OrderOut)
 def mark_in_flight(order_id: str, db: Session = Depends(get_db), supplier_id: str = Depends(require_supplier)):
     """
@@ -351,6 +374,11 @@ def get_drone_assignment(drone_id: str, db: Session = Depends(get_db)):
         "destination_hub_name": destination_hub.name if destination_hub else None,
         "destination_lat": destination_hub.gps_lat if destination_hub else None,
         "destination_lng": destination_hub.gps_lng if destination_hub else None,
+        # The Pi uploads the mission the moment it sees a new assignment
+        # (inert - no motors), but waits for this to flip True (supplier
+        # taps "Confirm & Launch" in the web UI -> confirm-launch endpoint
+        # above) before it arms/launches.
+        "launch_confirmed": order.launch_confirmed_at is not None,
     }
 
 

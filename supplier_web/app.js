@@ -13,6 +13,7 @@ const routeConfirmEl = document.getElementById("route-confirm");
 const routeConfirmFromEl = document.getElementById("route-confirm-from");
 const routeConfirmToEl = document.getElementById("route-confirm-to");
 const routeConfirmStatusEl = document.getElementById("route-confirm-status");
+const confirmLaunchBtn = document.getElementById("confirm-launch-btn");
 const qrReaderEl = document.getElementById("qr-reader");
 
 let html5QrScanner = null;
@@ -55,6 +56,9 @@ function renderOrders(orders) {
     const dispatchBtn = document.getElementById(`dispatch-${order.order_id}`);
     if (dispatchBtn) dispatchBtn.onclick = () => openDispatchModal(order.order_id);
 
+    const launchBtn = document.getElementById(`launch-${order.order_id}`);
+    if (launchBtn) launchBtn.onclick = () => handleAction(order.order_id, "confirm-launch");
+
     const inFlightBtn = document.getElementById(`inflight-${order.order_id}`);
     if (inFlightBtn) inFlightBtn.onclick = () => handleAction(order.order_id, "mark-in-flight");
 
@@ -92,6 +96,11 @@ function orderCardHtml(order) {
       ${routeHtml}
       <div class="items-list">${itemsHtml}</div>
       ${order.drone_id ? `<div class="drone-tag">Drone: ${order.drone_id}</div>` : ""}
+      ${
+        order.status === "dispatched" && order.launch_confirmed_at
+          ? `<div class="launch-tag">🛫 Launch confirmed — awaiting takeoff</div>`
+          : ""
+      }
       <div class="actions">
         ${actionButtonsHtml(order)}
       </div>
@@ -110,7 +119,16 @@ function actionButtonsHtml(order) {
     case "preparing":
       return `<button id="dispatch-${order.order_id}">Scan drone & dispatch</button>`;
     case "dispatched":
-      return `<button id="inflight-${order.order_id}" class="secondary">Mark in flight</button>`;
+      // The drone doesn't arm/launch until launch_confirmed_at is set - the
+      // supplier normally does this from the scan modal right after
+      // dispatching, but this card button covers the case where the modal
+      // was closed first (e.g. testing, or came back to it later).
+      return order.launch_confirmed_at
+        ? `<button id="inflight-${order.order_id}" class="secondary">Mark in flight (manual override)</button>`
+        : `
+          <button id="launch-${order.order_id}" class="launch-btn">🛫 Confirm &amp; Launch</button>
+          <button id="inflight-${order.order_id}" class="secondary">Mark in flight (manual override)</button>
+        `;
     case "in_flight":
       return `<button id="delivered-${order.order_id}">Mark delivered</button>`;
     default:
@@ -143,6 +161,7 @@ function openDispatchModal(orderId) {
   scanModal.classList.remove("hidden");
   manualInput.value = "";
   routeConfirmEl.classList.add("hidden");
+  confirmLaunchBtn.classList.add("hidden");
   qrReaderEl.classList.remove("hidden");
   startQrScanner();
 }
@@ -181,12 +200,14 @@ async function onDroneQrScanned(payload) {
 
   // Stop the camera and show the From -> To confirmation instead of closing
   // the modal immediately — the supplier should see where this is headed
-  // before/while the dispatch call completes.
+  // before the dispatch call completes.
   stopQrScanner();
   qrReaderEl.classList.add("hidden");
   routeConfirmFromEl.textContent = order?.origin_hub_name || order?.origin_hub_id || "—";
   routeConfirmToEl.textContent = order?.destination_hub_name || order?.destination_hub_id || "—";
-  routeConfirmStatusEl.textContent = "Confirming with drone…";
+  routeConfirmStatusEl.textContent = "Binding drone…";
+  routeConfirmStatusEl.classList.remove("ok");
+  confirmLaunchBtn.classList.add("hidden");
   routeConfirmEl.classList.remove("hidden");
 
   try {
@@ -194,16 +215,39 @@ async function onDroneQrScanned(payload) {
       method: "POST",
       body: JSON.stringify({ drone_qr_payload: payload }),
     });
-    routeConfirmStatusEl.textContent = "Dispatched ✓";
+    await refreshOrders();
+
+    // Dispatch is done, but the drone does NOT arm/launch yet — that only
+    // happens once the button below is tapped, which is the actual
+    // go/no-go moment, not the QR scan itself.
+    routeConfirmStatusEl.textContent = "Drone bound. Ready when you are.";
+    confirmLaunchBtn.classList.remove("hidden");
+    confirmLaunchBtn.disabled = false;
+    confirmLaunchBtn.textContent = "🛫 Confirm & Launch";
+    confirmLaunchBtn.onclick = () => confirmLaunch(orderId);
+  } catch (err) {
+    closeDispatchModal();
+    alert(err.message);
+  }
+}
+
+async function confirmLaunch(orderId) {
+  confirmLaunchBtn.disabled = true;
+  confirmLaunchBtn.textContent = "Launching…";
+  try {
+    await api(`/supplier/orders/${orderId}/confirm-launch`, { method: "POST" });
+    routeConfirmStatusEl.textContent = "Launched ✓ — drone is arming and taking off";
     routeConfirmStatusEl.classList.add("ok");
+    confirmLaunchBtn.classList.add("hidden");
     await refreshOrders();
     // Brief pause so the confirmation is actually readable before it closes.
     setTimeout(() => {
       routeConfirmStatusEl.classList.remove("ok");
       closeDispatchModal();
-    }, 1100);
+    }, 1400);
   } catch (err) {
-    closeDispatchModal();
+    confirmLaunchBtn.disabled = false;
+    confirmLaunchBtn.textContent = "🛫 Confirm & Launch";
     alert(err.message);
   }
 }

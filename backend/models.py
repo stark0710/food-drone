@@ -75,6 +75,15 @@ class Order(Base):
     total_cents = Column(Integer, nullable=False)
     status = Column(Enum(OrderStatus, name="order_status"), nullable=False, default=OrderStatus.placed)
     drone_id = Column(String(50), nullable=True)
+    # Set when the supplier taps "Confirm & Launch" in the web UI, after
+    # bind-drone-and-dispatch — the Pi's assignment poll waits for this
+    # before arming/launching, instead of launching the instant a mission
+    # uploads.
+    launch_confirmed_at = Column(DateTime(timezone=True), nullable=True)
+    # Set once the onboard Pi calls /drone/.../ack — i.e. the drone has actually
+    # received the mission, as opposed to just being bound in the DB by the
+    # supplier's QR scan. Distinct from dispatched_at for that reason.
+    mission_ack_at = Column(DateTime(timezone=True), nullable=True)
 
     placed_at = Column(DateTime(timezone=True), server_default=func.now())
     accepted_at = Column(DateTime(timezone=True), nullable=True)

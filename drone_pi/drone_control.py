@@ -5,12 +5,20 @@ since GPIO is optional (auto-skipped if RPi.GPIO isn't available/no hardware).
 
 FLIGHT LIFECYCLE (per assignment):
   1. Poll backend for a new assignment.
-  2. On a new assignment: upload a 3-item OUTBOUND mission
-     (TAKEOFF -> WAYPOINT -> LAND at the destination).
-  3. If AUTO_LAUNCH_OUTBOUND_ENABLED (default True): the Pi itself arms and
-     switches to AUTO immediately - fully autonomous, no human involved.
-     Set this False to go back to the original design where a human must
-     arm + switch to AUTO manually via RC or Mission Planner.
+  2. On a new assignment: upload a 4-item OUTBOUND mission
+     (placeholder -> TAKEOFF -> WAYPOINT -> LAND at the destination).
+     This is inert - no arming, no motion - safe to do the instant an
+     order is dispatched, before anyone has confirmed anything.
+  3. Wait for the supplier to tap "Confirm & Launch" in the supplier web
+     app. That calls POST /supplier/orders/{id}/confirm-launch on the
+     backend, which flips launch_confirmed=True in the same
+     /drones/{drone_id}/assignment payload this script already polls.
+     Only once THAT flips True does the Pi arm and switch to AUTO -
+     previously this happened the instant a mission uploaded, with no
+     human checkpoint between "drone QR scanned" and "props spinning".
+     Set AUTO_LAUNCH_OUTBOUND_ENABLED=False to go back to the fully
+     manual original design instead (human arms + switches to AUTO via
+     RC/Mission Planner, ignoring the confirm-launch flag entirely).
   4. Once armed+AUTO is detected (however it happened) -> tell the backend
      the order is "in_flight".
   5. Once the vehicle disarms after that (i.e. it landed at the
@@ -24,11 +32,12 @@ FLIGHT LIFECYCLE (per assignment):
   7. Once it disarms again (back home) -> ready for the next assignment.
 
 >>> SAFETY - READ BEFORE RUNNING ON REAL HARDWARE <<<
-With both AUTO_LAUNCH_OUTBOUND_ENABLED and AUTO_RETURN_ENABLED True (the
-default), this script arms and flies a real aircraft with ZERO human
-involvement at any point in the round trip - a bigger step than the
-original design, where at minimum a human had to physically launch the
-outbound leg. Before ever running this against a real Pixhawk:
+With AUTO_LAUNCH_OUTBOUND_ENABLED True (the default), the OUTBOUND leg now
+arms and launches itself the moment the supplier taps "Confirm & Launch" -
+there's a human checkpoint (the button), but no one has to be standing at
+the aircraft or holding a transmitter when it actually happens. With
+AUTO_RETURN_ENABLED True (also default), the RETURN leg has no human
+checkpoint of any kind. Before ever running this against a real Pixhawk:
   - Confirm geofence is configured and enabled (Config -> Geofence).
   - Confirm failsafes are configured (Config -> Failsafe: RC loss, battery,
     GCS loss, EKF) so a bad leg fails safe instead of just flying off.
@@ -382,19 +391,17 @@ def notify_backend(path):
         print(f"[{ts()}] [warn] failed to report {path}: {e}")
 
 
-def poll_assignment(had_assignment: bool):
-    """Returns (now_has_assignment, new_assignment_data_or_None)."""
+def poll_assignment():
+    """Returns the latest assignment dict, or None if the poll itself failed
+    (network error etc - NOT the same as has_assignment=False, which is a
+    normal/valid response meaning 'nothing assigned right now')."""
     try:
         resp = requests.get(f"{API_BASE_URL}/drones/{DRONE_ID}/assignment", timeout=5)
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
     except requests.RequestException as e:
         print(f"[{ts()}] [warn] poll failed: {e}")
-        return had_assignment, None
-
-    now_has_assignment = data.get("has_assignment", False)
-    is_new = now_has_assignment and not had_assignment
-    return now_has_assignment, (data if is_new else None)
+        return None
 
 
 class FlightState:
@@ -403,7 +410,7 @@ class FlightState:
 
     def __init__(self):
         self.armed_prev = False
-        self.leg = None  # None | "outbound" | "awaiting_return" | "return"
+        self.leg = None  # None | "mission_loaded" | "outbound" | "awaiting_return" | "return"
         self.dwell_until = None
         self.last_progress_print = 0.0
         self.reached_destination = False  # was MISSION_ITEM_REACHED seen for the destination waypoint?
@@ -528,31 +535,51 @@ def main():
             now = time.time()
 
             if now >= next_poll:
-                had_assignment, new_data = poll_assignment(had_assignment)
+                data = poll_assignment()
                 next_poll = now + POLL_INTERVAL_SECONDS
-                if new_data is not None:
-                    dest_name = new_data.get("destination_hub_name", "unknown destination")
-                    lat, lng = new_data.get("destination_lat"), new_data.get("destination_lng")
-                    print(f"[{ts()}] [assigned] order {new_data.get('order_id')} -> {dest_name} ({lat}, {lng})")
-                    led_blink()
-                    if lat is not None and lng is not None:
-                        if upload_mission(conn, lat, lng, CRUISE_ALTITUDE_M):
-                            state.leg = "outbound"
-                            state.destination_item_seq = DESTINATION_WAYPOINT_SEQ
-                            state.reached_destination = False
-                            if AUTO_LAUNCH_OUTBOUND_ENABLED:
-                                if not arm_and_set_mode(conn, COPTER_MODE_AUTO, "AUTO"):
-                                    print(f"[{ts()}] [warn] outbound arm was rejected - mission is uploaded "
-                                          f"and waiting, but nothing will launch until this is armed "
-                                          f"(manually via Mission Planner, or fix the PreArm issue and "
-                                          f"this will still be picked up next time you retry)")
+
+                if data is not None:
+                    has_assignment = data.get("has_assignment", False)
+
+                    if has_assignment and not had_assignment:
+                        # Brand new assignment: upload the mission now. This is
+                        # inert (no arming, no motion) - safe to do immediately,
+                        # before anyone has confirmed anything.
+                        dest_name = data.get("destination_hub_name", "unknown destination")
+                        lat, lng = data.get("destination_lat"), data.get("destination_lng")
+                        print(f"[{ts()}] [assigned] order {data.get('order_id')} -> {dest_name} ({lat}, {lng})")
+                        led_blink()
+                        if lat is not None and lng is not None:
+                            if upload_mission(conn, lat, lng, CRUISE_ALTITUDE_M):
+                                state.destination_item_seq = DESTINATION_WAYPOINT_SEQ
+                                state.reached_destination = False
+                                if AUTO_LAUNCH_OUTBOUND_ENABLED:
+                                    state.leg = "mission_loaded"
+                                    print(f"[{ts()}] [flight] mission uploaded - waiting for supplier to "
+                                          f"tap Confirm & Launch in the web app")
+                                else:
+                                    state.leg = "outbound"
+                                    print(f"[{ts()}] [flight] mission uploaded - waiting for human to "
+                                          f"arm+AUTO manually (AUTO_LAUNCH_OUTBOUND_ENABLED=False)")
                             else:
-                                print(f"[{ts()}] [flight] mission uploaded - waiting for human to arm+AUTO (AUTO_LAUNCH_OUTBOUND_ENABLED=False)")
-                    else:
-                        print(f"[{ts()}] [warn] no destination coordinates on this order - skipping waypoint upload")
-                    led_on()
-                elif not had_assignment:
-                    led_off()
+                                print(f"[{ts()}] [warn] mission upload failed - will retry on next new assignment")
+                        else:
+                            print(f"[{ts()}] [warn] no destination coordinates on this order - skipping waypoint upload")
+                        led_on()
+
+                    elif has_assignment and state.leg == "mission_loaded" and data.get("launch_confirmed"):
+                        # Supplier just tapped Confirm & Launch - this is the
+                        # human go/no-go moment. Arm and launch now.
+                        if arm_and_set_mode(conn, COPTER_MODE_AUTO, "AUTO"):
+                            state.leg = "outbound"
+                        else:
+                            print(f"[{ts()}] [warn] outbound arm was rejected after Confirm & Launch - "
+                                  f"will keep retrying on the next poll (check STATUSTEXT above for why)")
+
+                    elif not has_assignment:
+                        led_off()
+
+                    had_assignment = has_assignment
 
             msg = conn.recv_match(
                 type=["HEARTBEAT", "NAV_CONTROLLER_OUTPUT", "MISSION_ITEM_REACHED", "STATUSTEXT"],

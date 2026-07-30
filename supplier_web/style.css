@@ -233,3 +233,20 @@ button[id^="dispatch-"]:hover { background: var(--color-accent-dark); }
   color: var(--color-ink-muted);
 }
 .route-confirm-status.ok { color: var(--color-brand); }
+
+.launch-btn {
+  margin-top: 16px;
+  width: 100%;
+  background: var(--color-accent);
+  font-size: 16px;
+  padding: 14px 18px;
+}
+.launch-btn:hover { background: var(--color-accent-dark); }
+.launch-btn.hidden { display: none; }
+
+.launch-tag {
+  font-size: 12px;
+  color: var(--color-accent-dark);
+  margin-top: 8px;
+  font-weight: 700;
+}

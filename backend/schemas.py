@@ -64,6 +64,7 @@ class OrderOut(BaseModel):
     total_cents: int
     status: OrderStatus
     drone_id: Optional[str] = None
+    launch_confirmed_at: Optional[datetime] = None
     placed_at: Optional[datetime] = None
     accepted_at: Optional[datetime] = None
     preparing_at: Optional[datetime] = None
