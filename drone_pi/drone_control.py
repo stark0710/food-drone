@@ -54,6 +54,13 @@ import time
 import requests
 from pymavlink import mavutil
 
+
+def ts():
+    """HH:MM:SS timestamp prefix so log lines show real elapsed time between
+    events - without this, a mission that took 6 real minutes and one that
+    took 6 seconds look identical in the console."""
+    return time.strftime("%H:%M:%S")
+
 # ---- Config - edit these for your setup ----
 API_BASE_URL = "https://hubdrone-backend.onrender.com"
 DRONE_ID = "drone_042"                  # must match this drone's printed QR sticker
@@ -98,7 +105,7 @@ try:
     LED_AVAILABLE = True
 except (ImportError, RuntimeError):
     LED_AVAILABLE = False
-    print("[info] RPi.GPIO not available - LED disabled, running poll+mission logic only")
+    print(f"[{ts()}] [info] RPi.GPIO not available - LED disabled, running poll+mission logic only")
 
 
 def led_on():
@@ -122,10 +129,10 @@ def led_blink(times=6, on_seconds=0.15, off_seconds=0.15):
 
 
 def connect_mavlink():
-    print(f"[mavlink] connecting to {MAVLINK_CONNECTION} ...")
+    print(f"[{ts()}] [mavlink] connecting to {MAVLINK_CONNECTION} ...")
     conn = mavutil.mavlink_connection(MAVLINK_CONNECTION)
     conn.wait_heartbeat(timeout=15)
-    print(f"[mavlink] heartbeat received (system {conn.target_system}, component {conn.target_component})")
+    print(f"[{ts()}] [mavlink] heartbeat received (system {conn.target_system}, component {conn.target_component})")
     return conn
 
 
@@ -162,17 +169,17 @@ def upload_mission(conn, lat, lng, altitude_m):
     for _ in range(len(items)):
         msg = conn.recv_match(type=["MISSION_REQUEST", "MISSION_REQUEST_INT"], blocking=True, timeout=10)
         if msg is None:
-            print("[mavlink] ERROR: vehicle stopped requesting mission items - upload failed")
+            print(f"[{ts()}] [mavlink] ERROR: vehicle stopped requesting mission items - upload failed")
             return False
         seq = msg.seq
         conn.mav.mission_item_int_send(conn.target_system, conn.target_component, *items[seq])
 
     ack = conn.recv_match(type="MISSION_ACK", blocking=True, timeout=10)
     if ack and ack.type == mavutil.mavlink.MAV_MISSION_ACCEPTED:
-        print(f"[mavlink] mission uploaded and accepted: takeoff to {altitude_m}m -> {lat}, {lng} -> land")
+        print(f"[{ts()}] [mavlink] mission uploaded and accepted: takeoff to {altitude_m}m -> {lat}, {lng} -> land")
         return True
     else:
-        print(f"[mavlink] ERROR: mission upload not accepted (ack={ack})")
+        print(f"[{ts()}] [mavlink] ERROR: mission upload not accepted (ack={ack})")
         return False
 
 
@@ -191,18 +198,18 @@ def arm_and_set_mode(conn, mode_id: int, mode_name: str):
         mavutil.mavlink.MAV_CMD_COMPONENT_ARM_DISARM,
         0, 1, 0, 0, 0, 0, 0, 0,
     )
-    print(f"[mavlink] auto-launch: mode set to {mode_name}, arm command sent")
+    print(f"[{ts()}] [mavlink] auto-launch: mode set to {mode_name}, arm command sent")
 
 
 def notify_backend(path):
     try:
         resp = requests.post(f"{API_BASE_URL}/drones/{DRONE_ID}/{path}", timeout=5)
         if resp.status_code >= 400:
-            print(f"[warn] backend rejected {path}: {resp.status_code} {resp.text}")
+            print(f"[{ts()}] [warn] backend rejected {path}: {resp.status_code} {resp.text}")
         else:
-            print(f"[backend] reported {path}")
+            print(f"[{ts()}] [backend] reported {path}")
     except requests.RequestException as e:
-        print(f"[warn] failed to report {path}: {e}")
+        print(f"[{ts()}] [warn] failed to report {path}: {e}")
 
 
 def poll_assignment(had_assignment: bool):
@@ -212,7 +219,7 @@ def poll_assignment(had_assignment: bool):
         resp.raise_for_status()
         data = resp.json()
     except requests.RequestException as e:
-        print(f"[warn] poll failed: {e}")
+        print(f"[{ts()}] [warn] poll failed: {e}")
         return had_assignment, None
 
     now_has_assignment = data.get("has_assignment", False)
@@ -228,25 +235,39 @@ class FlightState:
         self.armed_prev = False
         self.leg = None  # None | "outbound" | "awaiting_return" | "return"
         self.dwell_until = None
+        self.last_progress_print = 0.0
+
+    def handle_nav_controller_output(self, msg):
+        """Prints periodic distance-to-waypoint/altitude while airborne, so
+        the log actually shows the vehicle covering ground over time instead
+        of just an arm event and a disarm event with nothing in between -
+        that gap is what made an earlier run look like it "teleported"."""
+        if self.leg not in ("outbound", "return"):
+            return
+        now = time.time()
+        if now - self.last_progress_print < 5:
+            return
+        self.last_progress_print = now
+        print(f"[{ts()}] [progress] leg={self.leg} wp_dist={msg.wp_dist}m alt_error={msg.alt_error:.1f}m")
 
     def handle_heartbeat(self, conn, msg):
         armed_now = bool(msg.base_mode & mavutil.mavlink.MAV_MODE_FLAG_SAFETY_ARMED)
 
         if armed_now and not self.armed_prev:
             if self.leg == "outbound":
-                print("[flight] outbound leg armed/launched")
+                print(f"[{ts()}] [flight] outbound leg armed/launched")
                 notify_backend("report-in-flight")
             elif self.leg == "return":
-                print("[flight] return leg armed/launched")
+                print(f"[{ts()}] [flight] return leg armed/launched")
 
         if (not armed_now) and self.armed_prev:
             if self.leg == "outbound":
-                print("[flight] landed at destination - delivery complete")
+                print(f"[{ts()}] [flight] landed at destination - delivery complete")
                 notify_backend("report-delivered")
                 self.dwell_until = time.time() + UNLOAD_DWELL_SECONDS
                 self.leg = "awaiting_return"
             elif self.leg == "return":
-                print("[flight] landed back at home - round trip complete")
+                print(f"[{ts()}] [flight] landed back at home - round trip complete")
                 self.leg = None
 
         self.armed_prev = armed_now
@@ -266,12 +287,12 @@ class FlightState:
             # upload or coordinate tracking needed from this script at all.
             arm_and_set_mode(conn, COPTER_MODE_RTL, "RTL")
         else:
-            print("[flight] awaiting return - AUTO_RETURN_ENABLED=False, waiting for human to arm+RTL manually")
+            print(f"[{ts()}] [flight] awaiting return - AUTO_RETURN_ENABLED=False, waiting for human to arm+RTL manually")
 
 
 def main():
     conn = connect_mavlink()
-    print(f"[poll] watching {API_BASE_URL}/drones/{DRONE_ID}/assignment every {POLL_INTERVAL_SECONDS}s")
+    print(f"[{ts()}] [poll] watching {API_BASE_URL}/drones/{DRONE_ID}/assignment every {POLL_INTERVAL_SECONDS}s")
     state = FlightState()
     had_assignment = False
     next_poll = 0.0
@@ -286,7 +307,7 @@ def main():
                 if new_data is not None:
                     dest_name = new_data.get("destination_hub_name", "unknown destination")
                     lat, lng = new_data.get("destination_lat"), new_data.get("destination_lng")
-                    print(f"[assigned] order {new_data.get('order_id')} -> {dest_name} ({lat}, {lng})")
+                    print(f"[{ts()}] [assigned] order {new_data.get('order_id')} -> {dest_name} ({lat}, {lng})")
                     led_blink()
                     if lat is not None and lng is not None:
                         if upload_mission(conn, lat, lng, CRUISE_ALTITUDE_M):
@@ -294,16 +315,19 @@ def main():
                             if AUTO_LAUNCH_OUTBOUND_ENABLED:
                                 arm_and_set_mode(conn, COPTER_MODE_AUTO, "AUTO")
                             else:
-                                print("[flight] mission uploaded - waiting for human to arm+AUTO (AUTO_LAUNCH_OUTBOUND_ENABLED=False)")
+                                print(f"[{ts()}] [flight] mission uploaded - waiting for human to arm+AUTO (AUTO_LAUNCH_OUTBOUND_ENABLED=False)")
                     else:
-                        print("[warn] no destination coordinates on this order - skipping waypoint upload")
+                        print(f"[{ts()}] [warn] no destination coordinates on this order - skipping waypoint upload")
                     led_on()
                 elif not had_assignment:
                     led_off()
 
-            msg = conn.recv_match(type="HEARTBEAT", blocking=True, timeout=0.5)
+            msg = conn.recv_match(type=["HEARTBEAT", "NAV_CONTROLLER_OUTPUT"], blocking=True, timeout=0.5)
             if msg is not None:
-                state.handle_heartbeat(conn, msg)
+                if msg.get_type() == "HEARTBEAT":
+                    state.handle_heartbeat(conn, msg)
+                elif msg.get_type() == "NAV_CONTROLLER_OUTPUT":
+                    state.handle_nav_controller_output(msg)
 
             state.maybe_launch_return(conn)
 
