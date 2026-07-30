@@ -100,6 +100,16 @@ COPTER_MODE_RTL = 6
 LAND_ITEM_SEQ = 3  # index of the LAND command in the fixed 4-item mission
                     # built by upload_mission() (0=home placeholder,
                     # 1=takeoff, 2=waypoint, 3=land)
+DESTINATION_WAYPOINT_SEQ = LAND_ITEM_SEQ - 1  # the actual destination
+                    # coordinates. ArduCopter sends MISSION_ITEM_REACHED
+                    # for regular NAV_WAYPOINT items (arrival-radius based)
+                    # but NOT for NAV_LAND, which is a continuous descent
+                    # with no "reached" event of its own - waiting on
+                    # LAND_ITEM_SEQ here would never fire even on a fully
+                    # successful delivery. The waypoint immediately before
+                    # LAND is what actually confirms arrival at the
+                    # destination; the subsequent LAND+disarm is just the
+                    # descent, confirmed separately via the disarm itself.
 
 # Number of consecutive disarmed heartbeats required before a "disarmed"
 # transition is treated as real. Heartbeats arrive roughly 1/sec, so 3
@@ -329,16 +339,16 @@ class FlightState:
         self.leg = None  # None | "outbound" | "awaiting_return" | "return"
         self.dwell_until = None
         self.last_progress_print = 0.0
-        self.reached_land_seq = False  # was MISSION_ITEM_REACHED seen for the LAND item?
-        self.land_item_seq = None      # set by main() right after each upload_mission() call
+        self.reached_destination = False  # was MISSION_ITEM_REACHED seen for the destination waypoint?
+        self.destination_item_seq = None  # set by main() right after each upload_mission() call
         self._disarmed_streak = 0      # consecutive heartbeats reporting disarmed since last armed
 
     def handle_mission_item_reached(self, msg):
         if self.leg not in ("outbound", "return"):
             return
         print(f"[{ts()}] [progress] leg={self.leg} mission item reached: seq={msg.seq}")
-        if self.land_item_seq is not None and msg.seq == self.land_item_seq:
-            self.reached_land_seq = True
+        if self.destination_item_seq is not None and msg.seq == self.destination_item_seq:
+            self.reached_destination = True
 
     def handle_statustext(self, msg):
         # ArduPilot pushes fence breaches, failsafe triggers, arming
@@ -388,20 +398,20 @@ class FlightState:
                 return  # not confirmed yet, wait for more heartbeats
 
             if self.leg == "outbound":
-                if self.reached_land_seq:
+                if self.reached_destination:
                     print(f"[{ts()}] [flight] landed at destination - delivery complete")
                     notify_backend("report-delivered")
                     self.dwell_until = time.time() + UNLOAD_DWELL_SECONDS
                     self.leg = "awaiting_return"
                 else:
-                    # Disarmed without ever reaching the LAND item - this is
-                    # an abort (failsafe RTL, fence breach, manual override,
-                    # etc.), not a delivery. Do NOT report delivered and do
-                    # NOT auto-relaunch anything: check the [vehicle]
-                    # STATUSTEXT lines above for the actual reason, fix it,
-                    # then dispatch a fresh assignment once it's sorted.
+                    # Disarmed without ever reaching the destination waypoint
+                    # - this is an abort (failsafe RTL, fence breach, manual
+                    # override, etc.), not a delivery. Do NOT report
+                    # delivered and do NOT auto-relaunch anything: check the
+                    # [vehicle] STATUSTEXT lines above for the actual reason,
+                    # fix it, then dispatch a fresh assignment once sorted.
                     print(f"[{ts()}] [flight] *** ABORT: disarmed without reaching destination "
-                          f"(never saw mission item {self.land_item_seq} reached). Check STATUSTEXT "
+                          f"(never saw waypoint {self.destination_item_seq} reached). Check STATUSTEXT "
                           f"lines above for the failsafe/fence reason. NOT reporting delivered, "
                           f"NOT auto-relaunching. ***")
                     self.leg = None
@@ -459,8 +469,8 @@ def main():
                     if lat is not None and lng is not None:
                         if upload_mission(conn, lat, lng, CRUISE_ALTITUDE_M):
                             state.leg = "outbound"
-                            state.land_item_seq = LAND_ITEM_SEQ
-                            state.reached_land_seq = False
+                            state.destination_item_seq = DESTINATION_WAYPOINT_SEQ
+                            state.reached_destination = False
                             if AUTO_LAUNCH_OUTBOUND_ENABLED:
                                 if not arm_and_set_mode(conn, COPTER_MODE_AUTO, "AUTO"):
                                     print(f"[{ts()}] [warn] outbound arm was rejected - mission is uploaded "
