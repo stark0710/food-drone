@@ -22,8 +22,8 @@ try:
     db.merge(Hub(
         hub_id="HUB_A",
         name="Downtown Hub A",
-        gps_lat=12.2436562,
-        gps_lng=79.0090504,
+        gps_lat=12.2527857
+        gps_lng=79.0131810,
         marker_id="HUBMARKER_A",   # <-- this string is the ONLY thing the physical QR encodes
         is_origin=True,
         is_destination=True,

@@ -65,6 +65,8 @@ class OrderOut(BaseModel):
     status: OrderStatus
     drone_id: Optional[str] = None
     launch_confirmed_at: Optional[datetime] = None
+    payload_locked: Optional[bool] = None
+    drone_returned_home_at: Optional[datetime] = None
     placed_at: Optional[datetime] = None
     accepted_at: Optional[datetime] = None
     preparing_at: Optional[datetime] = None
