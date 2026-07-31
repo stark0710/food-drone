@@ -38,11 +38,20 @@ try:
     ))
     db.commit()
 
+    # image_url values are generic labeled placeholders (placehold.co), not
+    # real food photography - picked because they're guaranteed to resolve
+    # rather than hotlinking third-party photo URLs of unknown uptime.
+    # Swap these for real hosted photos whenever you have them; nothing else
+    # needs to change, the app just renders whatever URL is in this column.
     menu_items = [
-        MenuItem(item_id="item_burger", supplier_id="sup_test_1", name="Chicken Burger", price_cents=699, available=True),
-        MenuItem(item_id="item_fries", supplier_id="sup_test_1", name="Fries", price_cents=299, available=True),
-        MenuItem(item_id="item_salad", supplier_id="sup_test_1", name="Garden Salad", price_cents=599, available=True),
-        MenuItem(item_id="item_soda", supplier_id="sup_test_1", name="Soda", price_cents=199, available=True),
+        MenuItem(item_id="item_burger", supplier_id="sup_test_1", name="Chicken Burger", price_cents=699,
+                 image_url="https://placehold.co/200x200/f3c98b/6b3f14?text=Burger", available=True),
+        MenuItem(item_id="item_fries", supplier_id="sup_test_1", name="Fries", price_cents=299,
+                 image_url="https://placehold.co/200x200/f6d88a/8a5a12?text=Fries", available=True),
+        MenuItem(item_id="item_salad", supplier_id="sup_test_1", name="Garden Salad", price_cents=599,
+                 image_url="https://placehold.co/200x200/bfe3b0/2c5c1f?text=Salad", available=True),
+        MenuItem(item_id="item_soda", supplier_id="sup_test_1", name="Soda", price_cents=199,
+                 image_url="https://placehold.co/200x200/aee0e8/155a63?text=Soda", available=True),
     ]
     for item in menu_items:
         db.merge(item)

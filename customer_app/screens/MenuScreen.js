@@ -1,16 +1,15 @@
 import React, { useState, useMemo } from "react";
 import {
-  View, Text, FlatList, StyleSheet, TouchableOpacity, Alert, ActivityIndicator,
+  View, Text, FlatList, StyleSheet, TouchableOpacity, Image,
 } from "react-native";
-import { placeOrder } from "../api";
 import { colors } from "../theme";
+import { formatINR } from "../format";
 
 // hub.suppliers already comes back scoped to the locked hub_id from scan-hub.
 // Prototype has exactly one supplier, but this renders generically off the array.
 export default function MenuScreen({ route, navigation }) {
   const { hub } = route.params;
   const [cart, setCart] = useState({}); // item_id -> qty
-  const [placing, setPlacing] = useState(false);
 
   // Prototype scope: one supplier. Grab the first (only) one.
   const supplier = hub.suppliers[0];
@@ -35,18 +34,18 @@ export default function MenuScreen({ route, navigation }) {
     });
   };
 
-  const handlePlaceOrder = async () => {
+  const handleProceedToPayment = () => {
     if (itemCount === 0) return;
-    setPlacing(true);
-    try {
-      const items = Object.entries(cart).map(([item_id, qty]) => ({ item_id, qty }));
-      const order = await placeOrder({ hubId: hub.hub_id, supplierId: supplier.supplier_id, items });
-      navigation.replace("OrderStatus", { orderId: order.order_id, hub });
-    } catch (err) {
-      Alert.alert("Couldn't place order", err.message);
-    } finally {
-      setPlacing(false);
-    }
+    // Build the line items now, while we still have full menu_items in
+    // scope (name/price), so PaymentMethod/OrderSummary don't need their
+    // own copy of the menu - they just carry this array forward.
+    const orderLines = Object.entries(cart).map(([item_id, qty]) => {
+      const menuItem = supplier.menu_items.find((m) => m.item_id === item_id);
+      return { item_id, qty, name: menuItem.name, price_cents: menuItem.price_cents };
+    });
+    navigation.navigate("PaymentMethod", {
+      hub, supplier, orderLines, total,
+    });
   };
 
   if (!supplier) {
@@ -70,9 +69,16 @@ export default function MenuScreen({ route, navigation }) {
           const qty = cart[item.item_id] || 0;
           return (
             <View style={styles.row}>
+              {item.image_url ? (
+                <Image source={{ uri: item.image_url }} style={styles.thumb} />
+              ) : (
+                <View style={[styles.thumb, styles.thumbFallback]}>
+                  <Text style={styles.thumbFallbackText}>{item.name.charAt(0)}</Text>
+                </View>
+              )}
               <View style={{ flex: 1 }}>
                 <Text style={styles.itemName}>{item.name}</Text>
-                <Text style={styles.itemPrice}>${(item.price_cents / 100).toFixed(2)}</Text>
+                <Text style={styles.itemPrice}>{formatINR(item.price_cents)}</Text>
               </View>
               <View style={styles.stepper}>
                 <TouchableOpacity style={styles.stepBtn} onPress={() => changeQty(item.item_id, -1)}>
@@ -92,14 +98,10 @@ export default function MenuScreen({ route, navigation }) {
       />
 
       {itemCount > 0 && (
-        <TouchableOpacity style={styles.orderBar} onPress={handlePlaceOrder} disabled={placing}>
-          {placing ? (
-            <ActivityIndicator color="#fff" />
-          ) : (
-            <Text style={styles.orderBarText}>
-              Place order · {itemCount} item{itemCount > 1 ? "s" : ""} · ${(total / 100).toFixed(2)}
-            </Text>
-          )}
+        <TouchableOpacity style={styles.orderBar} onPress={handleProceedToPayment}>
+          <Text style={styles.orderBarText}>
+            Place order · {itemCount} item{itemCount > 1 ? "s" : ""} · {formatINR(total)}
+          </Text>
         </TouchableOpacity>
       )}
     </View>
@@ -123,6 +125,11 @@ const styles = StyleSheet.create({
   },
   itemName: { fontSize: 16, fontWeight: "600", color: colors.ink },
   itemPrice: { fontSize: 14, color: colors.inkMuted, marginTop: 2 },
+  thumb: {
+    width: 56, height: 56, borderRadius: 12, marginRight: 12, backgroundColor: colors.border,
+  },
+  thumbFallback: { justifyContent: "center", alignItems: "center" },
+  thumbFallbackText: { fontSize: 20, fontWeight: "800", color: colors.inkMuted },
   stepper: { flexDirection: "row", alignItems: "center" },
   stepBtn: {
     width: 34, height: 34, borderRadius: 17, backgroundColor: colors.border,

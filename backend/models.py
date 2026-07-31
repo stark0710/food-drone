@@ -59,6 +59,7 @@ class MenuItem(Base):
     supplier_id = Column(String(50), ForeignKey("suppliers.supplier_id"), nullable=False)
     name = Column(String(150), nullable=False)
     price_cents = Column(Integer, nullable=False)
+    image_url = Column(String(500), nullable=True)
     available = Column(Boolean, nullable=False, default=True)
     created_at = Column(DateTime(timezone=True), server_default=func.now())
 
@@ -95,6 +96,10 @@ class Order(Base):
     # True = locked, False = unlocked.
     payload_locked = Column(Boolean, nullable=True)
 
+    # Chosen on PaymentMethodScreen before the order is actually placed.
+    # "cash_on_delivery" | "upi" for this prototype - no real payment
+    # gateway integration, just the customer's stated choice.
+    payment_method = Column(String(20), nullable=True)
     placed_at = Column(DateTime(timezone=True), server_default=func.now())
     accepted_at = Column(DateTime(timezone=True), nullable=True)
     preparing_at = Column(DateTime(timezone=True), nullable=True)

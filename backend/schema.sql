@@ -29,6 +29,7 @@ CREATE TABLE menu_items (
     supplier_id VARCHAR(50) NOT NULL REFERENCES suppliers(supplier_id),
     name        VARCHAR(150) NOT NULL,
     price_cents INTEGER NOT NULL,
+    image_url   VARCHAR(500),
     available   BOOLEAN NOT NULL DEFAULT TRUE,
     created_at  TIMESTAMPTZ NOT NULL DEFAULT now()
 );
@@ -51,6 +52,7 @@ CREATE TABLE orders (
     total_cents     INTEGER NOT NULL,
     status          order_status NOT NULL DEFAULT 'placed',
     drone_id        VARCHAR(50),                -- bound at dispatch time via drone QR scan
+    payment_method  VARCHAR(20),                -- 'cash_on_delivery' | 'upi', chosen pre-order
     placed_at       TIMESTAMPTZ NOT NULL DEFAULT now(),
     accepted_at     TIMESTAMPTZ,
     preparing_at    TIMESTAMPTZ,

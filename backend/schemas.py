@@ -10,6 +10,7 @@ class MenuItemOut(BaseModel):
     item_id: str
     name: str
     price_cents: int
+    image_url: Optional[str] = None
     available: bool
 
     class Config:
@@ -39,6 +40,7 @@ class PlaceOrderRequest(BaseModel):
     hub_id: str            # locked from the customer's scanned session
     supplier_id: str
     items: List[OrderItemIn]
+    payment_method: Optional[str] = None  # "cash_on_delivery" | "upi"
 
 
 class OrderItemOut(BaseModel):
@@ -64,6 +66,7 @@ class OrderOut(BaseModel):
     total_cents: int
     status: OrderStatus
     drone_id: Optional[str] = None
+    payment_method: Optional[str] = None
     launch_confirmed_at: Optional[datetime] = None
     payload_locked: Optional[bool] = None
     drone_returned_home_at: Optional[datetime] = None

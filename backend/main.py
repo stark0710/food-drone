@@ -116,6 +116,7 @@ def order_to_out(o: Order, db: Session) -> schemas.OrderOut:
         total_cents=o.total_cents,
         status=o.status,
         drone_id=o.drone_id,
+        payment_method=o.payment_method,
         launch_confirmed_at=o.launch_confirmed_at,
         payload_locked=o.payload_locked,
         drone_returned_home_at=o.drone_returned_home_at,
@@ -210,6 +211,10 @@ def place_order(
     if not req.items:
         raise HTTPException(status_code=400, detail="Order must contain at least one item")
 
+    VALID_PAYMENT_METHODS = {"cash_on_delivery", "upi"}
+    if req.payment_method is not None and req.payment_method not in VALID_PAYMENT_METHODS:
+        raise HTTPException(status_code=400, detail=f"Invalid payment_method: {req.payment_method}")
+
     order_items = []
     total_cents = 0
     for line in req.items:
@@ -234,6 +239,7 @@ def place_order(
         items=order_items,
         total_cents=total_cents,
         status=OrderStatus.placed,
+        payment_method=req.payment_method,
     )
     db.add(order)
     db.commit()
@@ -291,7 +297,7 @@ def list_incoming_orders(
             Order.status != OrderStatus.cancelled,
             ~((Order.status == OrderStatus.delivered) & (Order.drone_returned_home_at.isnot(None))),
         )
-        .order_by(Order.placed_at.asc())
+        .order_by(Order.placed_at.desc())
         .all()
     )
     return [order_to_out(o, db) for o in orders]

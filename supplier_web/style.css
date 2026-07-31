@@ -1,3 +1,27 @@
+/* ---- TorqWings brand bar ----
+   #0a0f1c is TorqWings' actual site theme-color (dark navy). The cyan
+   accent below is a reasonable aerospace/tech pairing for that navy, but
+   isn't pulled from their stylesheet directly — swap --torqwings-accent
+   if you have an exact brand hex from their design assets. */
+:root {
+  --torqwings-navy: #0a0f1c;
+  --torqwings-accent: #34d3e0;
+}
+
+.brand-bar {
+  background: var(--torqwings-navy);
+  padding: 10px 20px;
+  display: flex;
+  align-items: center;
+}
+
+.brand-name {
+  color: var(--torqwings-accent);
+  font-weight: 700;
+  font-size: 18px;
+  letter-spacing: 0.02em;
+}
+
 /* ---- Color system ---- */
 :root {
   --color-bg: #f4f6f5;
