@@ -84,16 +84,6 @@ class Order(Base):
     # received the mission, as opposed to just being bound in the DB by the
     # supplier's QR scan. Distinct from dispatched_at for that reason.
     mission_ack_at = Column(DateTime(timezone=True), nullable=True)
-    # Set by the Pi once RTL completes and it's back on the ground at home -
-    # moves the order from "active" to "previous" in the supplier UI. Kept
-    # separate from delivered_at since the order is fully delivered (and
-    # the customer app shows it as such) well before the drone physically
-    # makes it back.
-    drone_returned_home_at = Column(DateTime(timezone=True), nullable=True)
-    # Payload compartment lock state, toggled by the supplier from the web
-    # UI once a drone is bound to this order. None until first touched;
-    # True = locked, False = unlocked.
-    payload_locked = Column(Boolean, nullable=True)
 
     placed_at = Column(DateTime(timezone=True), server_default=func.now())
     accepted_at = Column(DateTime(timezone=True), nullable=True)

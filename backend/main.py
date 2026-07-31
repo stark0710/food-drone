@@ -43,17 +43,6 @@ Base.metadata.create_all(bind=engine)
 _NEW_ORDER_COLUMNS = {
     "launch_confirmed_at": "TIMESTAMPTZ" if engine.dialect.name == "postgresql" else "DATETIME",
     "mission_ack_at": "TIMESTAMPTZ" if engine.dialect.name == "postgresql" else "DATETIME",
-    # Set by the Pi once RTL completes and it lands back home - the signal
-    # that moves a delivered order from "active" to "previous" in the
-    # supplier UI. Deliberately separate from delivered_at: an order
-    # becomes "delivered" the moment it lands at the destination, but
-    # should stay visible/active in the supplier's list until the drone
-    # is actually back and free for the next dispatch.
-    "drone_returned_home_at": "TIMESTAMPTZ" if engine.dialect.name == "postgresql" else "DATETIME",
-    # Payload compartment lock state, toggled manually by the supplier.
-    # BOOLEAN works the same way on Postgres and SQLite, no dialect branch
-    # needed here unlike the timestamp columns above.
-    "payload_locked": "BOOLEAN",
 }
 _existing_columns = {c["name"] for c in inspect(engine).get_columns("orders")}
 with engine.connect() as _conn:
@@ -117,8 +106,6 @@ def order_to_out(o: Order, db: Session) -> schemas.OrderOut:
         status=o.status,
         drone_id=o.drone_id,
         launch_confirmed_at=o.launch_confirmed_at,
-        payload_locked=o.payload_locked,
-        drone_returned_home_at=o.drone_returned_home_at,
         placed_at=o.placed_at,
         accepted_at=o.accepted_at,
         preparing_at=o.preparing_at,
@@ -277,42 +264,17 @@ def list_incoming_orders(
     supplier_id: str = Depends(require_supplier),
 ):
     """
-    ACTIVE queue. Deliberately includes orders that are already "delivered"
-    as long as the drone hasn't made it back home yet (drone_returned_home_at
-    still null) - the order should stay visible with its status simply
-    updated to "delivered", not vanish the instant the food is dropped off.
-    It only moves to the /previous list once the drone is actually back and
-    free for the next dispatch.
+    Incoming queue: everything not yet delivered/cancelled for this supplier.
+    Prototype has one supplier, but this already scopes by supplier_id so it's
+    correct once there are more.
     """
     orders = (
         db.query(Order)
         .filter(
             Order.supplier_id == supplier_id,
-            Order.status != OrderStatus.cancelled,
-            ~((Order.status == OrderStatus.delivered) & (Order.drone_returned_home_at.isnot(None))),
+            Order.status.notin_([OrderStatus.delivered, OrderStatus.cancelled]),
         )
         .order_by(Order.placed_at.asc())
-        .all()
-    )
-    return [order_to_out(o, db) for o in orders]
-
-
-@app.get("/supplier/orders/previous", response_model=List[schemas.OrderOut])
-def list_previous_orders(
-    db: Session = Depends(get_db),
-    supplier_id: str = Depends(require_supplier),
-):
-    """Archive view: cancelled orders, plus delivered orders whose drone has
-    confirmed it's back home. Most recent first."""
-    orders = (
-        db.query(Order)
-        .filter(
-            Order.supplier_id == supplier_id,
-            (Order.status == OrderStatus.cancelled)
-            | ((Order.status == OrderStatus.delivered) & (Order.drone_returned_home_at.isnot(None))),
-        )
-        .order_by(Order.placed_at.desc())
-        .limit(50)
         .all()
     )
     return [order_to_out(o, db) for o in orders]
@@ -439,10 +401,6 @@ def get_drone_assignment(drone_id: str, db: Session = Depends(get_db)):
         # taps "Confirm & Launch" in the web UI -> confirm-launch endpoint
         # above) before it arms/launches.
         "launch_confirmed": order.launch_confirmed_at is not None,
-        # Servo target state - True/False/None (never touched yet). The Pi
-        # is responsible for actually driving the servo and should treat
-        # None as "leave as-is" rather than forcing a default.
-        "payload_locked": order.payload_locked,
     }
 
 
@@ -482,58 +440,6 @@ def report_delivered(drone_id: str, db: Session = Depends(get_db)):
     if not order:
         raise HTTPException(status_code=404, detail="No in-flight order for this drone")
     return order_to_out(transition(order, OrderStatus.delivered, db), db)
-
-
-@app.post("/drones/{drone_id}/report-returned-home")
-def report_returned_home(drone_id: str, db: Session = Depends(get_db)):
-    """
-    Called by the Pi once it detects the vehicle has disarmed after the
-    RETURN (RTL) leg - i.e. it's physically back home, not just delivered.
-    Does not change order.status (delivered is already the correct final
-    business status) - this only sets drone_returned_home_at, which is what
-    moves the order from the supplier's "Active" list to "Previous" once
-    the drone is actually free again, rather than the instant the food
-    itself was dropped off.
-    """
-    order = (
-        db.query(Order)
-        .filter(
-            Order.drone_id == drone_id,
-            Order.status == OrderStatus.delivered,
-            Order.drone_returned_home_at.is_(None),
-        )
-        .order_by(Order.delivered_at.desc())
-        .first()
-    )
-    if not order:
-        raise HTTPException(status_code=404, detail="No delivered-but-not-yet-returned order for this drone")
-    order.drone_returned_home_at = now()
-    db.commit()
-    db.refresh(order)
-    return order_to_out(order, db)
-
-
-@app.post("/supplier/orders/{order_id}/set-payload-lock", response_model=schemas.OrderOut)
-def set_payload_lock(
-    order_id: str,
-    locked: bool,
-    db: Session = Depends(get_db),
-    supplier_id: str = Depends(require_supplier),
-):
-    """
-    Toggled from the supplier web page once a drone is bound to the order
-    (shown right after the drone QR scan, alongside the drone_id). Purely
-    manual - no auto-lock/unlock tied to dispatch or landing, per the
-    explicit design decision this matches. The Pi polls this via the
-    /drones/{drone_id}/assignment response (payload_locked field) and
-    drives the actual servo; this endpoint just records the requested
-    state; it does not itself move anything.
-    """
-    order = _get_supplier_order(db, order_id, supplier_id)
-    order.payload_locked = locked
-    db.commit()
-    db.refresh(order)
-    return order_to_out(order, db)
 
 
 @app.get("/health")
