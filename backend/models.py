@@ -3,7 +3,7 @@ from sqlalchemy import (
     Column, String, Boolean, Float, Integer, ForeignKey, JSON, DateTime, Enum
 )
 from sqlalchemy.sql import func
-from database import Base
+from backend.database import Base
 
 
 class OrderStatus(str, enum.Enum):
