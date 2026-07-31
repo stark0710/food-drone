@@ -100,6 +100,10 @@ AUTO_LAUNCH_OUTBOUND_ENABLED = True
 AUTO_RETURN_ENABLED = True
 
 LED_PIN = 17  # BCM numbering, GPIO17 = physical pin 11
+SERVO_PIN = 27  # BCM numbering, GPIO27 = physical pin 13. Change to match your wiring.
+SERVO_PWM_FREQ_HZ = 50  # standard for hobby servos
+SERVO_LOCKED_ANGLE = 0     # degrees - tune to your actual lock mechanism
+SERVO_UNLOCKED_ANGLE = 90  # degrees - tune to your actual lock mechanism
 
 # ArduCopter custom_mode numbers (from the ArduCopter flight-mode enum,
 # not a general MAVLink constant).
@@ -156,6 +160,49 @@ def led_blink(times=6, on_seconds=0.15, off_seconds=0.15):
         time.sleep(on_seconds)
         GPIO.output(LED_PIN, GPIO.LOW)
         time.sleep(off_seconds)
+
+
+# Servo uses the same RPi.GPIO import as the LED above - set up here rather
+# than duplicating the try/except, since if GPIO isn't available at all
+# (e.g. running on a laptop against SITL) neither the LED nor the servo can
+# do anything, for the same reason.
+_servo_pwm = None
+if LED_AVAILABLE:
+    try:
+        GPIO.setup(SERVO_PIN, GPIO.OUT)
+        _servo_pwm = GPIO.PWM(SERVO_PIN, SERVO_PWM_FREQ_HZ)
+        _servo_pwm.start(0)
+        SERVO_AVAILABLE = True
+    except Exception as e:
+        SERVO_AVAILABLE = False
+        print(f"[{ts()}] [info] Servo setup failed ({e}) - payload lock/unlock disabled")
+else:
+    SERVO_AVAILABLE = False
+
+
+def _servo_angle_to_duty_cycle(angle_deg: float) -> float:
+    # Standard hobby-servo mapping: 2% duty = 0 deg, 12% duty = 180 deg.
+    return 2 + (angle_deg / 18)
+
+
+def _set_servo_angle(angle_deg: float):
+    if not SERVO_AVAILABLE:
+        return
+    duty = _servo_angle_to_duty_cycle(angle_deg)
+    _servo_pwm.ChangeDutyCycle(duty)
+    time.sleep(0.4)  # give the servo time to actually move before cutting signal
+    _servo_pwm.ChangeDutyCycle(0)  # stop sending pulses once positioned - reduces
+                                    # jitter/buzz on cheap servos; re-sent on next change
+
+
+def servo_lock():
+    print(f"[{ts()}] [servo] locking payload compartment")
+    _set_servo_angle(SERVO_LOCKED_ANGLE)
+
+
+def servo_unlock():
+    print(f"[{ts()}] [servo] unlocking payload compartment")
+    _set_servo_angle(SERVO_UNLOCKED_ANGLE)
 
 
 def connect_mavlink():
@@ -491,6 +538,7 @@ class FlightState:
                     self.leg = None
             elif self.leg == "return":
                 print(f"[{ts()}] [flight] landed back at home - round trip complete")
+                notify_backend("report-returned-home")
                 self.leg = None
 
             self.armed_prev = False
@@ -529,6 +577,10 @@ def main():
     state = FlightState()
     had_assignment = False
     next_poll = 0.0
+    last_applied_lock_state = None  # None | True | False - tracks the servo's
+                                     # last-commanded position, so we only
+                                     # actually move it on an actual change,
+                                     # not every single poll cycle
 
     try:
         while True:
@@ -540,6 +592,11 @@ def main():
 
                 if data is not None:
                     has_assignment = data.get("has_assignment", False)
+
+                    payload_locked = data.get("payload_locked")
+                    if payload_locked is not None and payload_locked != last_applied_lock_state:
+                        servo_lock() if payload_locked else servo_unlock()
+                        last_applied_lock_state = payload_locked
 
                     if has_assignment and not had_assignment:
                         # Brand new assignment: upload the mission now. This is
@@ -602,6 +659,8 @@ def main():
         pass
     finally:
         led_off()
+        if SERVO_AVAILABLE:
+            _servo_pwm.stop()
         if LED_AVAILABLE:
             GPIO.cleanup()
 

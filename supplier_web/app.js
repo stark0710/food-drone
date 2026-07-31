@@ -4,6 +4,9 @@ const SUPPLIER_TOKEN = "supplier-dev-token";
 const POLL_INTERVAL_MS = 4000;
 
 const ordersListEl = document.getElementById("orders-list");
+const ordersListPreviousEl = document.getElementById("orders-list-previous");
+const tabActiveBtn = document.getElementById("tab-active");
+const tabPreviousBtn = document.getElementById("tab-previous");
 const connStatusEl = document.getElementById("conn-status");
 const scanModal = document.getElementById("scan-modal");
 const scanCancelBtn = document.getElementById("scan-cancel");
@@ -67,6 +70,9 @@ function renderOrders(orders) {
 
     const cancelBtn = document.getElementById(`cancel-${order.order_id}`);
     if (cancelBtn) cancelBtn.onclick = () => handleAction(order.order_id, "cancel");
+
+    const lockBtn = document.getElementById(`lock-${order.order_id}`);
+    if (lockBtn) lockBtn.onclick = () => handleTogglePayloadLock(order.order_id, !order.payload_locked);
   });
 }
 
@@ -95,7 +101,16 @@ function orderCardHtml(order) {
       </div>
       ${routeHtml}
       <div class="items-list">${itemsHtml}</div>
-      ${order.drone_id ? `<div class="drone-tag">Drone: ${order.drone_id}</div>` : ""}
+      ${
+        order.drone_id
+          ? `
+        <div class="drone-tag">Drone: ${order.drone_id}</div>
+        <button id="lock-${order.order_id}" class="lock-btn ${order.payload_locked ? "locked" : "unlocked"}">
+          ${order.payload_locked ? "🔒 Payload locked — tap to unlock" : "🔓 Payload unlocked — tap to lock"}
+        </button>
+      `
+          : ""
+      }
       ${
         order.status === "dispatched" && order.launch_confirmed_at
           ? `<div class="launch-tag">🛫 Launch confirmed — awaiting takeoff</div>`
@@ -148,6 +163,15 @@ async function handleMarkPrepared(orderId) {
 async function handleAction(orderId, actionPath) {
   try {
     await api(`/supplier/orders/${orderId}/${actionPath}`, { method: "POST" });
+    await refreshOrders();
+  } catch (err) {
+    alert(err.message);
+  }
+}
+
+async function handleTogglePayloadLock(orderId, lockTo) {
+  try {
+    await api(`/supplier/orders/${orderId}/set-payload-lock?locked=${lockTo}`, { method: "POST" });
     await refreshOrders();
   } catch (err) {
     alert(err.message);
@@ -258,12 +282,76 @@ manualSubmit.onclick = () => {
 };
 scanCancelBtn.onclick = closeDispatchModal;
 
+// ---- Previous orders (read-only archive) ----
+
+function previousOrderCardHtml(order) {
+  const itemsHtml = order.items
+    .map((i) => `<div>${i.qty}× ${i.name} — ${fmtMoney(i.price_cents * i.qty)}</div>`)
+    .join("");
+  const originName = order.origin_hub_name || order.origin_hub_id;
+  const destName = order.destination_hub_name || order.destination_hub_id;
+
+  return `
+    <div class="order-card previous">
+      <div class="order-card-top">
+        <div>
+          <div class="order-id">#${order.order_id.replace("ord_", "")}</div>
+          <span class="status-badge status-${order.status}">${order.status.replace("_", " ")}</span>
+        </div>
+        <div class="order-total">${fmtMoney(order.total_cents)}</div>
+      </div>
+      <div class="hub-route">
+        <span class="hub-route-label">Route</span>
+        <span class="hub-route-path">${originName} <span class="route-arrow">→</span> ${destName}</span>
+      </div>
+      <div class="items-list">${itemsHtml}</div>
+      ${order.drone_id ? `<div class="drone-tag">Drone: ${order.drone_id}</div>` : ""}
+      ${
+        order.drone_returned_home_at
+          ? `<div class="returned-tag">Drone returned home ${new Date(order.drone_returned_home_at).toLocaleString()}</div>`
+          : ""
+      }
+    </div>
+  `;
+}
+
+function renderPreviousOrders(orders) {
+  if (orders.length === 0) {
+    ordersListPreviousEl.innerHTML = `<p class="empty-state">No previous orders yet.</p>`;
+    return;
+  }
+  ordersListPreviousEl.innerHTML = orders.map(previousOrderCardHtml).join("");
+}
+
+// ---- Tab switching ----
+
+function showActiveTab() {
+  tabActiveBtn.classList.add("active");
+  tabPreviousBtn.classList.remove("active");
+  ordersListEl.classList.remove("hidden");
+  ordersListPreviousEl.classList.add("hidden");
+}
+
+function showPreviousTab() {
+  tabPreviousBtn.classList.add("active");
+  tabActiveBtn.classList.remove("active");
+  ordersListPreviousEl.classList.remove("hidden");
+  ordersListEl.classList.add("hidden");
+}
+
+tabActiveBtn.onclick = showActiveTab;
+tabPreviousBtn.onclick = showPreviousTab;
+
 // ---- polling loop ----
 
 async function refreshOrders() {
   try {
-    const orders = await api(`/supplier/orders`);
-    renderOrders(orders);
+    const [active, previous] = await Promise.all([
+      api(`/supplier/orders`),
+      api(`/supplier/orders/previous`),
+    ]);
+    renderOrders(active);
+    renderPreviousOrders(previous);
     connStatusEl.textContent = "live";
     connStatusEl.className = "pill ok";
   } catch (err) {

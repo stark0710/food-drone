@@ -9,11 +9,20 @@
 </head>
 <body>
   <header>
-    <h1>Hub A Kitchen — Incoming Orders</h1>
+    <h1>Hub A Kitchen — Orders</h1>
     <span id="conn-status" class="pill">connecting…</span>
   </header>
 
+  <nav class="tabs">
+    <button id="tab-active" class="tab-btn active">Active Orders</button>
+    <button id="tab-previous" class="tab-btn">Previous Orders</button>
+  </nav>
+
   <main id="orders-list">
+    <p class="empty-state">Loading orders…</p>
+  </main>
+
+  <main id="orders-list-previous" class="hidden">
     <p class="empty-state">Loading orders…</p>
   </main>
 
