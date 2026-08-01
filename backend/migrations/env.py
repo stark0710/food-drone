@@ -1,4 +1,5 @@
 from logging.config import fileConfig
+import os
 
 from sqlalchemy import engine_from_config
 from sqlalchemy import pool
@@ -8,6 +9,19 @@ from alembic import context
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
 config = context.config
+
+# Prefer the DATABASE_URL environment variable (same one main.py/database.py
+# use) over whatever's hardcoded in alembic.ini. This matters because
+# alembic.ini currently has the live Render Postgres URL - password included
+# - committed directly in the file, which is a real credential leak if this
+# repo is on GitHub (it is). Once this env-var override is in place, replace
+# the value in alembic.ini with a harmless local-dev default, and rotate the
+# real DB password in the Render dashboard (Database -> hubdrone-db -> the
+# credentials section has a reset/rotate option) since the old one has to be
+# treated as already exposed.
+_env_db_url = os.getenv("DATABASE_URL")
+if _env_db_url:
+    config.set_main_option("sqlalchemy.url", _env_db_url)
 
 # Interpret the config file for Python logging.
 # This line sets up loggers basically.

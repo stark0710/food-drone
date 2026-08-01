@@ -3,6 +3,7 @@ import { View, Text, StyleSheet, FlatList, TouchableOpacity, Alert, ActivityIndi
 import { placeOrder } from "../api";
 import { colors } from "../theme";
 import { formatINR } from "../format";
+import { addOrderToHistory } from "../orderHistory";
 
 const PAYMENT_LABELS = {
   cash_on_delivery: "Cash on Delivery",
@@ -25,6 +26,15 @@ export default function OrderSummaryScreen({ route, navigation }) {
         supplierId: supplier.supplier_id,
         items,
         paymentMethod,
+      });
+      await addOrderToHistory({
+        orderId: order.order_id,
+        hub,
+        supplierName: supplier.name,
+        itemCount: orderLines.reduce((n, l) => n + l.qty, 0),
+        total,
+        paymentMethod,
+        placedAt: new Date().toISOString(),
       });
       navigation.replace("OrderStatus", { orderId: order.order_id, hub });
     } catch (err) {

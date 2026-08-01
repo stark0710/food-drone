@@ -1,4 +1,5 @@
 import React from "react";
+import { TouchableOpacity, Text } from "react-native";
 import { NavigationContainer } from "@react-navigation/native";
 import { createNativeStackNavigator } from "@react-navigation/native-stack";
 import { StatusBar } from "expo-status-bar";
@@ -8,6 +9,7 @@ import MenuScreen from "./screens/MenuScreen";
 import PaymentMethodScreen from "./screens/PaymentMethodScreen";
 import OrderSummaryScreen from "./screens/OrderSummaryScreen";
 import OrderStatusScreen from "./screens/OrderStatusScreen";
+import OrderHistoryScreen from "./screens/OrderHistoryScreen";
 import BrandHeaderTitle from "./components/BrandHeaderTitle";
 import { colors } from "./theme";
 
@@ -30,13 +32,33 @@ export default function App() {
           headerTintColor: colors.brandBarText,
         }}
       >
-        <Stack.Screen name="Scan" component={ScanScreen} />
+        <Stack.Screen
+          name="Scan"
+          component={ScanScreen}
+          options={({ navigation }) => ({
+            headerRight: () => (
+              <TouchableOpacity onPress={() => navigation.navigate("OrderHistory")}>
+                <Text style={{ color: colors.brandBarText, fontWeight: "700", fontSize: 14 }}>
+                  My Orders
+                </Text>
+              </TouchableOpacity>
+            ),
+          })}
+        />
         <Stack.Screen name="Menu" component={MenuScreen} options={{ headerBackVisible: false }} />
         <Stack.Screen name="PaymentMethod" component={PaymentMethodScreen} />
         <Stack.Screen name="OrderSummary" component={OrderSummaryScreen} />
-        <Stack.Screen name="OrderStatus" component={OrderStatusScreen} options={{ headerBackVisible: false }} />
+        <Stack.Screen
+          name="OrderStatus"
+          component={OrderStatusScreen}
+          options={({ route }) => ({ headerBackVisible: !!route.params?.fromHistory })}
+        />
+        <Stack.Screen
+          name="OrderHistory"
+          component={OrderHistoryScreen}
+          options={{ title: "", headerBackTitle: "" }}
+        />
       </Stack.Navigator>
     </NavigationContainer>
   );
 }
-
